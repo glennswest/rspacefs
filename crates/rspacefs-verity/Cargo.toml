@@ -1,0 +1,23 @@
+[package]
+name = "rspacefs-verity"
+description = "Pure-Rust userspace dm-verity / fs-verity Merkle hash tree for read-only layer integrity verification. SHA-256 over 4 KB blocks, lock-free verified-block cache, vfs::FileSystem wrapper."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rspacefs_verity"
+path = "src/lib.rs"
+
+[dependencies]
+vfs = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rspacefs-core = { path = "../rspacefs-core" }

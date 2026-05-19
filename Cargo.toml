@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/rspacefs-core",
+    "crates/rspacefs-verity",
+    "crates/rspacefs-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Glenn West"]
+license = "MIT"
+repository = "https://github.com/glennswest/rspacefs"
+rust-version = "1.75"
+description = "Pure-Rust userspace OverlayFS and dm-verity. No NFS, no kernel, no async — direct file I/O via the vfs trait."
+
+[workspace.dependencies]
+vfs = "0.12"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

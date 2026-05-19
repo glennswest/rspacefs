@@ -1,0 +1,21 @@
+[package]
+name = "rspacefs-cli"
+description = "Command-line tool for inspecting OverlayFS-style mounts and building/verifying dm-verity-style Merkle layer manifests."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rspacefs"
+path = "src/main.rs"
+
+[dependencies]
+rspacefs-core = { path = "../rspacefs-core" }
+rspacefs-verity = { path = "../rspacefs-verity" }
+vfs = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
