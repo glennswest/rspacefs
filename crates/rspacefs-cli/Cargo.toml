@@ -1,6 +1,6 @@
 [package]
 name = "rspacefs-cli"
-description = "Command-line tool for inspecting OverlayFS-style mounts and building/verifying dm-verity-style Merkle layer manifests."
+description = "Command-line tool for inspecting LayerFS-style mounts and building/verifying dm-verity-style Merkle layer manifests."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

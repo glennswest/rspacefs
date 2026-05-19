@@ -1,8 +1,10 @@
-//! OverlayFS-like virtual filesystem.
+//! Userspace layered virtual filesystem — replaces kernel overlayfs.
 //!
 //! Merges multiple read-only lower layers with a writable upper layer,
-//! implementing the `vfs::FileSystem` trait. Supports whiteout markers
-//! (OCI image spec), copy-up on write, and merged directory listings.
+//! implementing the `vfs::FileSystem` trait. Same merge / whiteout /
+//! copy-up semantics as the kernel `fs/overlayfs/` driver, but in pure
+//! Rust user-space — no kernel module, no FUSE at this layer. OCI image
+//! spec whiteout markers (`.wh.<name>`, `.wh..wh..opq`) are honored.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -17,27 +19,27 @@ pub const WHITEOUT_PREFIX: &str = ".wh.";
 /// Opaque whiteout marker — blocks all lower layer entries in a directory.
 pub const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
-/// OverlayFS virtual filesystem.
+/// LayerFS virtual filesystem.
 ///
 /// Merges a writable `upper` layer with zero or more read-only `lower` layers.
 /// Write operations go to `upper`. Read operations check `upper` first, then
 /// walk lower layers top-down. Deleted entries are tracked via whiteout markers.
-pub struct OverlayFS {
+pub struct LayerFS {
     upper: VfsPath,
     /// Lower layers ordered top-down (index 0 is highest priority).
     lower: Vec<VfsPath>,
 }
 
-impl fmt::Debug for OverlayFS {
+impl fmt::Debug for LayerFS {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OverlayFS")
+        f.debug_struct("LayerFS")
             .field("upper", &self.upper.as_str())
             .field("lower_count", &self.lower.len())
             .finish()
     }
 }
 
-impl OverlayFS {
+impl LayerFS {
     /// Create a new overlay filesystem.
     ///
     /// - `upper`: writable layer (all writes go here)
@@ -263,7 +265,7 @@ impl OverlayFS {
     }
 }
 
-impl vfs::FileSystem for OverlayFS {
+impl vfs::FileSystem for LayerFS {
     fn read_dir(&self, path: &str) -> VfsResult<Box<dyn Iterator<Item = String> + Send>> {
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
@@ -499,7 +501,7 @@ mod tests {
             .write_all(b"print('hello')\n")
             .unwrap();
 
-        VfsPath::new(OverlayFS::new(upper, vec![lower1, lower2]))
+        VfsPath::new(LayerFS::new(upper, vec![lower1, lower2]))
     }
 
     /// Helper to collect readdir entries as filenames.
@@ -558,7 +560,7 @@ mod tests {
             .write_all(b"upper")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![lower]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![lower]));
         let mut buf = String::new();
         ov.join("file.txt")
             .unwrap()
@@ -766,7 +768,7 @@ mod tests {
             .write_all(b"upper")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![lower]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![lower]));
         let entries = readdir_names(&ov.join("etc").unwrap());
         assert!(entries.contains(&"resolv.conf".to_string()));
         assert!(!entries.contains(&"passwd".to_string()));
@@ -856,7 +858,7 @@ mod tests {
             .write_all(b"bbb")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![lower]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![lower]));
 
         ov.join("olddir")
             .unwrap()
@@ -874,7 +876,7 @@ mod tests {
     #[test]
     fn test_empty_overlay() {
         let upper = VfsPath::new(MemoryFS::new());
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![]));
         let entries = readdir_names(&ov);
         assert!(entries.is_empty());
     }
@@ -891,7 +893,7 @@ mod tests {
             .write_all(b"data")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![lower]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![lower]));
         assert!(ov.join("file.txt").unwrap().exists().unwrap());
     }
 
@@ -907,7 +909,7 @@ mod tests {
             .write_all(b"lower")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![lower]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![lower]));
 
         ov.join("file.txt").unwrap().remove_file().unwrap();
         assert!(!ov.join("file.txt").unwrap().exists().unwrap());
@@ -982,7 +984,7 @@ mod tests {
             .write_all(b"one")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![layer1, layer2, layer3]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![layer1, layer2, layer3]));
         let mut buf = String::new();
         ov.join("file.txt")
             .unwrap()
@@ -1021,7 +1023,7 @@ mod tests {
             .write_all(b"c")
             .unwrap();
 
-        let ov = VfsPath::new(OverlayFS::new(upper, vec![layer1, layer2]));
+        let ov = VfsPath::new(LayerFS::new(upper, vec![layer1, layer2]));
         let entries = readdir_names(&ov);
         assert_eq!(entries.len(), 3);
         assert!(entries.contains(&"a.txt".to_string()));

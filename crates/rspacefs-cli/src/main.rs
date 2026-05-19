@@ -1,4 +1,4 @@
-//! `rspacefs` — CLI for inspecting OverlayFS mounts and managing verity layer manifests.
+//! `rspacefs` — CLI for inspecting LayerFS mounts and managing verity layer manifests.
 //!
 //! Two subcommands: `overlay` (merge layers and read through them) and
 //! `verity` (build / verify / inspect Merkle-tree layer manifests).
@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rspacefs_core::OverlayFS;
+use rspacefs_core::LayerFS;
 use rspacefs_verity::{
     LayerManifest, MerkleTree, OnFailure, VerifiedLayerVfs, BLOCK_SIZE,
 };
 use vfs::{PhysicalFS, VfsPath};
 
 #[derive(Parser)]
-#[command(name = "rspacefs", version, about = "Userspace OverlayFS + verity tools", long_about = None)]
+#[command(name = "rspacefs", version, about = "Userspace LayerFS + verity tools", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -122,7 +122,7 @@ fn build_overlay(upper: PathBuf, lower: Vec<PathBuf>) -> Result<VfsPath> {
         .into_iter()
         .map(|p| VfsPath::new(PhysicalFS::new(p)))
         .collect();
-    Ok(VfsPath::new(OverlayFS::new(upper_vfs, lower_vfs)))
+    Ok(VfsPath::new(LayerFS::new(upper_vfs, lower_vfs)))
 }
 
 fn run_overlay(op: OverlayOp) -> Result<()> {

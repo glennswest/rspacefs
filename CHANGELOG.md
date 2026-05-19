@@ -3,13 +3,15 @@
 ## [Unreleased]
 
 ### 2026-05-19
-- **feat:** `rspacefs-fuse` crate (binary: `rspacefs-mount`). Real Linux FUSE mount of an `OverlayFS` (with optional verity-protected lowers). Implements lookup, getattr, setattr, readdir, mkdir, rmdir, open, read, write, release, create, unlink, rename, statfs — enough for container rootfs use cases like podman/CRI-O. `fuser` and `libc` deps are gated to `cfg(target_os = "linux")` so the workspace still builds on Mac dev boxes (the binary compiles to a stub that errors at runtime with a clear message). Build the real binary on a Linux host: `cargo build -p rspacefs-fuse`.
+- **BREAKING:** Renamed `OverlayFS` struct → `LayerFS`, file `overlay.rs` → `layer.rs`, to remove any ambiguity with the kernel `overlayfs` module. The whole point of rspacefs is to *replace* kernel overlayfs in user-space — the type name now reflects that. Public-API users update `use rspacefs_core::OverlayFS` → `use rspacefs_core::LayerFS`. CLI subcommand `rspacefs overlay …` kept as-is (lowercase word remains semantic).
+- **feat (fuse):** Preserve POSIX metadata through the FUSE mount. `vfs::VfsMetadata` only carries `file_type` + `len`, so `rspacefs-mount` was synthesising `0o644`/`0o755` for every file — losing the executable bit on every binary in a lower layer and making `execve()` impossible. Fixed by giving `RspacefsFuse` the physical layer paths as a side-channel and `stat()`-ing the real backing file for `FileAttr` (mode, uid, gid, atime/mtime/ctime, nlink, rdev). Content I/O still goes through the layered overlay (so verity verification of lowers continues to apply); only metadata bypasses the lossy vfs trait. This is the difference between "podman can `pivot_root` here" and "podman can actually `execve` the binaries it finds here."
+- **feat:** `rspacefs-fuse` crate (binary: `rspacefs-mount`). Real Linux FUSE mount of a `LayerFS` (with optional verity-protected lowers). Implements lookup, getattr, setattr, readdir, mkdir, rmdir, open, read, write, release, create, unlink, rename, statfs — enough for container rootfs use cases like podman/CRI-O. `fuser` and `libc` deps are gated to `cfg(target_os = "linux")` so the workspace still builds on Mac dev boxes (the binary compiles to a stub that errors at runtime with a clear message). Build the real binary on a Linux host: `cargo build -p rspacefs-fuse`.
 
 ## [v0.1.0] — 2026-05-19
 
 ### Added
 - Initial extraction from nextnfs `0.13.x`.
-- **rspacefs-core** — userspace OverlayFS implementing `vfs::FileSystem`:
+- **rspacefs-core** — userspace LayerFS implementing `vfs::FileSystem`:
   upper + N lower layers, OCI-spec whiteouts (`.wh.` and `.wh..wh..opq`),
   copy-up on write, merged sorted readdir, EXDEV-safe `move_dir`.
 - **rspacefs-verity** — SHA-256 Merkle tree over 4 KB blocks,
@@ -20,7 +22,7 @@
   `verity {build,verify,inspect}` subcommands.
 - Tests carried over verbatim: 24 in rspacefs-core, 30+ in rspacefs-verity
   (includes a cross-test that wraps a `VerifiedFS` as a lower layer of
-  `OverlayFS`, proving the two crates compose correctly).
+  `LayerFS`, proving the two crates compose correctly).
 - README, CLAUDE.md, Makefile, examples scaffolding.
 
 ### Architecture

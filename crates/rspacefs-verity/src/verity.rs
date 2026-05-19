@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_verified_fs_as_overlay_lower() {
-        use rspacefs_core::OverlayFS;
+        use rspacefs_core::LayerFS;
 
         // Create a verified lower layer.
         let lower_root = create_test_vfs();
@@ -1328,7 +1328,7 @@ mod tests {
         let upper: VfsPath = MemoryFS::new().into();
 
         // Build an overlay with the verified layer as a lower layer.
-        let ov = OverlayFS::new(upper, vec![verified_path]);
+        let ov = LayerFS::new(upper, vec![verified_path]);
         let ov_path: VfsPath = ov.into();
 
         // Read a file from the verified lower layer through the overlay.
@@ -1349,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_verified_fs_overlay_write_upper() {
-        use rspacefs_core::OverlayFS;
+        use rspacefs_core::LayerFS;
 
         // Create a verified lower layer.
         let lower_root = create_test_vfs();
@@ -1360,7 +1360,7 @@ mod tests {
         let upper: VfsPath = MemoryFS::new().into();
 
         // Build an overlay.
-        let ov = OverlayFS::new(upper, vec![verified_path]);
+        let ov = LayerFS::new(upper, vec![verified_path]);
         let ov_path: VfsPath = ov.into();
 
         // Write a new file — goes to upper.

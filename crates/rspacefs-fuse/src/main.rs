@@ -21,7 +21,7 @@ mod linux_main {
     use anyhow::{bail, Context, Result};
     use clap::Parser;
     use fuser::MountOption;
-    use rspacefs_core::OverlayFS;
+    use rspacefs_core::LayerFS;
     use rspacefs_verity::{OnFailure, VerifiedFS};
     use vfs::{PhysicalFS, VfsPath};
 
@@ -105,15 +105,18 @@ mod linux_main {
         // base image is verified and the app layer on top is not. Pass
         // multiple `--lower` flags if you need a different order.
         let mut lowers: Vec<VfsPath> = Vec::new();
+        let mut physical_layers: Vec<std::path::PathBuf> = vec![cli.upper.clone()];
         for l in &cli.lower_verified {
             let path = VfsPath::new(PhysicalFS::new(l.clone()));
             let verified = VerifiedFS::build(path, OnFailure::Reject).context(
                 format!("building verity manifest for {}", l.display()),
             )?;
             lowers.push(verified.into());
+            physical_layers.push(l.clone());
         }
         for l in &cli.lower {
             lowers.push(VfsPath::new(PhysicalFS::new(l.clone())));
+            physical_layers.push(l.clone());
         }
 
         tracing::info!(
@@ -124,8 +127,8 @@ mod linux_main {
             "starting rspacefs FUSE mount"
         );
 
-        let overlay = OverlayFS::new(upper, lowers);
-        let fs = RspacefsFuse::new(VfsPath::new(overlay));
+        let overlay = LayerFS::new(upper, lowers);
+        let fs = RspacefsFuse::new(VfsPath::new(overlay), physical_layers);
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName(cli.name.clone()),

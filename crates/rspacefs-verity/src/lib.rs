@@ -36,7 +36,7 @@
 //! `rspacefs-verity` is designed to be used as a tamper-evident lower layer
 //! beneath the [`rspacefs-core`](https://docs.rs/rspacefs-core) overlay.
 //! Wrap each read-only lower in `VerifiedFS::build(...)`, then hand the
-//! resulting `VfsPath` to `OverlayFS::new(upper, vec![verified_lower, ...])`.
+//! resulting `VfsPath` to `LayerFS::new(upper, vec![verified_lower, ...])`.
 //! The overlay handles merge/whiteout/copy-up; this crate handles integrity.
 
 #![warn(missing_docs)]

@@ -1,16 +1,17 @@
-//! FUSE adapter that exposes a `vfs::FileSystem` (typically an `OverlayFS`)
+//! FUSE adapter that exposes a `vfs::FileSystem` (typically a `LayerFS`)
 //! as a kernel-mountable filesystem via `fuser`.
 //!
 //! Maps the kernel's inode-centric, byte-offset-addressed FUSE protocol onto
-//! the path-based, stream-oriented `vfs::FileSystem` trait.
+//! the path-based, stream-oriented `vfs::FileSystem` trait — but with one
+//! escape hatch: for file *metadata* (mode bits, uid/gid, atime/mtime, nlink,
+//! rdev) we sidestep the lossy `vfs::VfsMetadata` and stat the underlying
+//! physical file directly. That preserves the executable bit, which is
+//! critical for container rootfs use (`/usr/bin/sh` etc. need to be
+//! `execve()`-able). Content I/O still goes through the overlay, so verity
+//! verification on lower layers continues to apply.
 //!
 //! ## Limitations
 //!
-//! - `vfs::VfsMetadata` only carries `file_type` and `len`. Mode bits, uid/gid,
-//!   atime/mtime/ctime are **synthesised**: files get `0o644`, directories
-//!   `0o755`, owned by the mounting process, with all timestamps set to the
-//!   mount-process start time. Full POSIX preservation needs an extended
-//!   metadata trait on top of `vfs`.
 //! - File data is read in full on open and cached in the file-handle table.
 //!   Fine for the typical container-rootfs read pattern (small config files,
 //!   binaries with kernel page-cache backing); not ideal for huge files.
@@ -18,11 +19,15 @@
 //! - `setattr` accepts truncate-to-zero and falls back to "no-op success" for
 //!   the rest. Container runtimes usually don't care; image builders sometimes
 //!   do.
+//! - Opaque-whiteout handling in the physical-resolution path matches simple
+//!   per-entry whiteouts; ancestor opaque markers (`.wh..wh..opq` in an
+//!   ancestor dir) fall back to overlay-reported metadata (synthesised mode).
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,14 +40,21 @@ use vfs::{VfsFileType, VfsPath};
 
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
-const FILE_MODE: u16 = 0o644;
-const DIR_MODE: u16 = 0o755;
+const FALLBACK_FILE_MODE: u16 = 0o644;
+const FALLBACK_DIR_MODE: u16 = 0o755;
 const BLOCK_SIZE: u32 = 4096;
+const WHITEOUT_PREFIX: &str = ".wh.";
 
-/// FUSE adapter wrapping a `vfs::FileSystem` (typically an `OverlayFS`).
+/// FUSE adapter wrapping a `vfs::FileSystem` (typically a `LayerFS`).
 pub struct RspacefsFuse {
-    /// The merged filesystem tree (overlay of upper + lowers).
+    /// The merged filesystem tree (overlay of upper + lowers). Used for all
+    /// content I/O so verity-protected lowers stay verified on read.
     root: VfsPath,
+    /// Physical layer directories in priority order: index 0 is the writable
+    /// upper, indices 1.. are read-only lowers. Used as a side-channel to
+    /// `stat()` the real backing file for accurate FileAttr (mode bits, uid,
+    /// gid, times, nlink, rdev). The `vfs` crate doesn't expose any of those.
+    layers: Vec<PathBuf>,
     /// inode → relative path (UTF-8 / `/`-separated, with "" for root).
     inodes: HashMap<u64, String>,
     /// path → inode (reverse, for stable allocation across lookups).
@@ -53,10 +65,12 @@ pub struct RspacefsFuse {
     next_fh: AtomicU64,
     /// open file table: fh → cached content + dirty flag.
     open_files: HashMap<u64, OpenFile>,
-    /// uid/gid of the mounting process — used to populate synthesised attrs.
-    uid: u32,
-    gid: u32,
-    /// Single timestamp stamped into all synthesised attrs (mount start).
+    /// uid/gid of the mounting process — used to populate fallback attrs
+    /// when the underlying physical file can't be located (shouldn't happen
+    /// for well-formed overlays, but `vfs` doesn't promise we can).
+    fallback_uid: u32,
+    fallback_gid: u32,
+    /// Single timestamp stamped into fallback attrs.
     mount_time: SystemTime,
 }
 
@@ -70,20 +84,27 @@ struct OpenFile {
 
 impl RspacefsFuse {
     /// Build a new FUSE adapter rooted at `root`.
-    pub fn new(root: VfsPath) -> Self {
+    ///
+    /// `layers` is the list of physical layer directories in priority order:
+    /// index 0 is the writable upper, indices 1.. are read-only lowers. We
+    /// keep these as a side-channel so we can `stat()` the real backing file
+    /// for an accurate FileAttr (mode bits, uid/gid, times, nlink) — the
+    /// `vfs` crate's metadata trait throws all of that away.
+    pub fn new(root: VfsPath, layers: Vec<PathBuf>) -> Self {
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
         inodes.insert(ROOT_INO, String::new());
         paths.insert(String::new(), ROOT_INO);
         Self {
             root,
+            layers,
             inodes,
             paths,
             next_ino: ROOT_INO + 1,
             next_fh: AtomicU64::new(1),
             open_files: HashMap::new(),
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            fallback_uid: unsafe { libc::getuid() },
+            fallback_gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
         }
     }
@@ -115,10 +136,67 @@ impl RspacefsFuse {
         })
     }
 
-    fn make_attr(&self, ino: u64, ft: VfsFileType, size: u64) -> FileAttr {
+    /// Find the on-disk physical file backing a given overlay path by walking
+    /// layers in priority order. Returns the first existing path that isn't
+    /// shadowed by an entry-level whiteout in the upper layer.
+    fn physical_for(&self, path: &str) -> Option<PathBuf> {
+        // Upper-layer whiteout: lower entries are masked.
+        if let Some((parent, name)) = split_parent_name(path) {
+            let mut wh = self.layers[0].clone();
+            if !parent.is_empty() {
+                wh.push(parent);
+            }
+            wh.push(format!("{}{}", WHITEOUT_PREFIX, name));
+            if wh.symlink_metadata().is_ok() {
+                return None;
+            }
+        }
+        for layer in &self.layers {
+            let p = layer.join(path);
+            if p.symlink_metadata().is_ok() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Build a FileAttr from the physical file backing this overlay path. If
+    /// the underlying file can't be stat'd, fall back to synthesised attrs
+    /// derived from the overlay-reported `VfsFileType` and size.
+    fn make_attr(&self, ino: u64, path: &str, ft: VfsFileType, size: u64) -> FileAttr {
+        if let Some(phys) = self.physical_for(path) {
+            if let Ok(m) = phys.symlink_metadata() {
+                let kind = if m.file_type().is_dir() {
+                    FileType::Directory
+                } else if m.file_type().is_symlink() {
+                    FileType::Symlink
+                } else {
+                    FileType::RegularFile
+                };
+                return FileAttr {
+                    ino,
+                    size: m.len(),
+                    blocks: m.len().div_ceil(BLOCK_SIZE as u64),
+                    atime: ts_or_default(m.accessed().ok(), self.mount_time),
+                    mtime: ts_or_default(m.modified().ok(), self.mount_time),
+                    ctime: ctime_or_default(&m, self.mount_time),
+                    crtime: ts_or_default(m.created().ok(), self.mount_time),
+                    kind,
+                    perm: (m.mode() as u16) & 0o7777,
+                    nlink: m.nlink() as u32,
+                    uid: m.uid(),
+                    gid: m.gid(),
+                    rdev: m.rdev() as u32,
+                    blksize: BLOCK_SIZE,
+                    flags: 0,
+                };
+            }
+        }
+        // Fallback when no physical file backs this path (shouldn't normally
+        // happen — overlay said it exists but disk says otherwise).
         let (kind, perm, nlink) = match ft {
-            VfsFileType::File => (FileType::RegularFile, FILE_MODE, 1),
-            VfsFileType::Directory => (FileType::Directory, DIR_MODE, 2),
+            VfsFileType::File => (FileType::RegularFile, FALLBACK_FILE_MODE, 1),
+            VfsFileType::Directory => (FileType::Directory, FALLBACK_DIR_MODE, 2),
         };
         FileAttr {
             ino,
@@ -131,8 +209,8 @@ impl RspacefsFuse {
             kind,
             perm,
             nlink,
-            uid: self.uid,
-            gid: self.gid,
+            uid: self.fallback_uid,
+            gid: self.fallback_gid,
             rdev: 0,
             blksize: BLOCK_SIZE,
             flags: 0,
@@ -145,7 +223,7 @@ impl RspacefsFuse {
             return None;
         }
         let m = p.metadata().ok()?;
-        Some(self.make_attr(ino, m.file_type, m.len))
+        Some(self.make_attr(ino, path, m.file_type, m.len))
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -182,8 +260,8 @@ impl Filesystem for RspacefsFuse {
             Err(_) => return reply.error(EIO),
         };
 
-        let ino = self.intern_path(path);
-        let attr = self.make_attr(ino, meta.file_type, meta.len);
+        let ino = self.intern_path(path.clone());
+        let attr = self.make_attr(ino, &path, meta.file_type, meta.len);
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -333,8 +411,8 @@ impl Filesystem for RspacefsFuse {
         if p.create_dir().is_err() {
             return reply.error(EIO);
         }
-        let ino = self.intern_path(path);
-        let attr = self.make_attr(ino, VfsFileType::Directory, 0);
+        let ino = self.intern_path(path.clone());
+        let attr = self.make_attr(ino, &path, VfsFileType::Directory, 0);
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -526,7 +604,7 @@ impl Filesystem for RspacefsFuse {
         }
 
         let ino = self.intern_path(path.clone());
-        let attr = self.make_attr(ino, VfsFileType::File, 0);
+        let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
         let fh = self.alloc_fh();
         self.open_files.insert(
             fh,
@@ -642,5 +720,36 @@ impl Filesystem for RspacefsFuse {
     }
 }
 
-// Silence the unused-import lint on platforms where it isn't pulled in.
-const _: fn(&OsString) = |_| {};
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Split a `/`-separated path into `(parent, name)`. Returns None for empty
+/// input (the root has no parent/name pair).
+fn split_parent_name(path: &str) -> Option<(&str, &str)> {
+    if path.is_empty() {
+        return None;
+    }
+    match path.rfind('/') {
+        Some(i) => Some((&path[..i], &path[i + 1..])),
+        None => Some(("", path)),
+    }
+}
+
+fn ts_or_default(t: Option<SystemTime>, fallback: SystemTime) -> SystemTime {
+    t.unwrap_or(fallback)
+}
+
+/// `MetadataExt::ctime()` returns the change-time as `(sec, nsec)` ints —
+/// build a SystemTime from those, or fall back if either is out of range.
+fn ctime_or_default(m: &std::fs::Metadata, fallback: SystemTime) -> SystemTime {
+    let sec = m.ctime();
+    let nsec = m.ctime_nsec();
+    if sec < 0 || nsec < 0 {
+        return fallback;
+    }
+    UNIX_EPOCH
+        .checked_add(Duration::new(sec as u64, nsec as u32))
+        .unwrap_or(fallback)
+}
+
+// Silence unused-import warnings on uncommon configurations.
+const _: fn(&Path) = |_| {};

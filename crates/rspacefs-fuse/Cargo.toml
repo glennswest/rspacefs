@@ -1,6 +1,6 @@
 [package]
 name = "rspacefs-fuse"
-description = "Mount an OverlayFS-style upper+lowers as a FUSE filesystem. End-user binary backed by rspacefs-core; pairs with rspacefs-verity for tamper-evident lowers."
+description = "Mount a LayerFS-style upper+lowers as a FUSE filesystem. End-user binary backed by rspacefs-core; pairs with rspacefs-verity for tamper-evident lowers."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

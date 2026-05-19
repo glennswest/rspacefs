@@ -1,6 +1,6 @@
 # CLAUDE.md — rspacefs Project
 
-Pure-Rust userspace OverlayFS + dm-verity. Extracted from nextnfs on
+Pure-Rust userspace LayerFS + dm-verity. Extracted from nextnfs on
 2026-05-19 so callers can use the layered-rootfs primitives without any
 NFS / network / kernel-module dependency.
 
@@ -25,10 +25,10 @@ networking) but does use `std` for file I/O via the `vfs` crate.
 
 | Crate              | Path                       | Lines | Purpose                                                                 |
 |--------------------|----------------------------|-------|-------------------------------------------------------------------------|
-| `rspacefs-core`    | `crates/rspacefs-core/`    | ~1030 | OverlayFS impl: upper + N lower layers, OCI whiteouts, copy-up.         |
+| `rspacefs-core`    | `crates/rspacefs-core/`    | ~1030 | LayerFS impl: upper + N lower layers, OCI whiteouts, copy-up.         |
 | `rspacefs-verity`  | `crates/rspacefs-verity/`  | ~1390 | SHA-256 Merkle tree, layer manifest, verified-block cache, verified FS. |
 | `rspacefs-cli`     | `crates/rspacefs-cli/`     | ~250  | `rspacefs` binary: `overlay {ls,cat,stat}`, `verity {build,verify,inspect}`. |
-| `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | ~500  | `rspacefs-mount` Linux daemon: real FUSE mount of an OverlayFS, with optional verified lowers. Stub binary on non-Linux. |
+| `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | ~500  | `rspacefs-mount` Linux daemon: real FUSE mount of a LayerFS, with optional verified lowers. Stub binary on non-Linux. |
 
 Both library crates implement `vfs::FileSystem` and compose freely — a
 verified read-only layer can be a lower layer of an overlay, an overlay
@@ -129,7 +129,7 @@ Test inventory at extraction time:
   through layers, opaque whiteouts, three-layer stacking, EXDEV-safe move.
 - **rspacefs-verity**: 30+ tests covering tree build / verify / serialize /
   manifest JSON / verified-block cache / `FileSystem` integration. Includes
-  cross-test wrapping `VerifiedFS` as a lower layer of `OverlayFS`.
+  cross-test wrapping `VerifiedFS` as a lower layer of `LayerFS`.
 
 ## File pointers
 

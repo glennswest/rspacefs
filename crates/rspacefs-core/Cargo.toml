@@ -1,6 +1,6 @@
 [package]
 name = "rspacefs-core"
-description = "Pure-Rust userspace OverlayFS: layered read-only lowers + writable upper, OCI whiteouts, copy-up on write. vfs::FileSystem impl, no kernel, no async."
+description = "Pure-Rust userspace LayerFS: layered read-only lowers + writable upper, OCI whiteouts, copy-up on write. vfs::FileSystem impl, no kernel, no async."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

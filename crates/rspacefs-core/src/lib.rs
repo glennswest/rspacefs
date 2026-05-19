@@ -1,22 +1,22 @@
 //! # rspacefs-core
 //!
-//! Pure-Rust userspace OverlayFS-like virtual filesystem built on the
-//! [`vfs`](https://crates.io/crates/vfs) trait. Merges multiple read-only
-//! lower layers with a writable upper layer, with OCI-spec whiteout markers
-//! and copy-up-on-write semantics — the same model the Linux kernel
-//! overlayfs uses, implemented entirely in user-space.
+//! Pure-Rust userspace layered virtual filesystem — a **replacement for
+//! kernel overlayfs**, built on the [`vfs`](https://crates.io/crates/vfs)
+//! trait. Merges multiple read-only lower layers with a writable upper
+//! layer, with OCI-spec whiteout markers and copy-up-on-write semantics —
+//! the same model the Linux kernel `fs/overlayfs/` driver uses,
+//! implemented entirely in user-space.
 //!
-//! This crate is intentionally minimal: no async, no kernel, no networking,
-//! no protocol. Operations are direct synchronous calls against whatever
-//! `vfs::FileSystem` backend you plug in (real disk via `PhysicalFS`,
-//! in-memory via `MemoryFS`, your own custom backend, etc.). Performance
-//! and concurrency are the caller's responsibility — which is the whole
-//! point of splitting this out of the original NFS server.
+//! This crate is intentionally minimal: no async, no kernel module, no
+//! networking, no protocol. Operations are direct synchronous calls
+//! against whatever `vfs::FileSystem` backend you plug in (real disk via
+//! `PhysicalFS`, in-memory via `MemoryFS`, your own custom backend, etc.).
+//! Performance and concurrency are the caller's responsibility.
 //!
 //! ## Quick start
 //!
 //! ```no_run
-//! use rspacefs_core::OverlayFS;
+//! use rspacefs_core::LayerFS;
 //! use vfs::{PhysicalFS, VfsPath};
 //! use std::path::PathBuf;
 //!
@@ -25,8 +25,8 @@
 //! let app   = VfsPath::new(PhysicalFS::new(PathBuf::from("/var/lib/myapp/lower-app")));
 //!
 //! // Lower layers are top-down: index 0 is highest priority.
-//! let overlay = OverlayFS::new(upper, vec![app, base]);
-//! let root: VfsPath = overlay.into();
+//! let layers = LayerFS::new(upper, vec![app, base]);
+//! let root: VfsPath = layers.into();
 //!
 //! // Now `root` behaves like a merged read/write filesystem.
 //! ```
@@ -48,6 +48,6 @@
 
 #![warn(missing_docs)]
 
-mod overlay;
+mod layer;
 
-pub use overlay::OverlayFS;
+pub use layer::LayerFS;

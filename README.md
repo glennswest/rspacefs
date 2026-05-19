@@ -1,13 +1,13 @@
 # rspacefs
 
-**Pure-Rust userspace OverlayFS + dm-verity. No kernel, no NFS, no async.**
+**Pure-Rust userspace LayerFS + dm-verity. No kernel, no NFS, no async.**
 
 `rspacefs` provides two building blocks for layered, integrity-verified
 container rootfs assembly that previously required kernel modules:
 
 | Crate              | Role                                                                                                     |
 |--------------------|-----------------------------------------------------------------------------------------------------------|
-| `rspacefs-core`    | Userspace OverlayFS — merge N read-only lower layers with a writable upper layer, OCI whiteouts, copy-up. |
+| `rspacefs-core`    | Userspace LayerFS — merge N read-only lower layers with a writable upper layer, OCI whiteouts, copy-up. |
 | `rspacefs-verity`  | Userspace dm-verity — SHA-256 Merkle tree over 4 KB blocks, per-file manifest, verified-block cache.      |
 | `rspacefs-cli`     | `rspacefs` command-line tool — `overlay ls/cat/stat`, `verity build/verify/inspect`.                      |
 | `rspacefs-fuse`    | `rspacefs-mount` Linux daemon — exposes an overlay (with optional verified lowers) as a real FUSE mount. |
@@ -42,7 +42,7 @@ overlay logic, ~1,400 LOC of verity, no dependencies beyond `vfs`, `sha2`,
 ### Library — overlay only
 
 ```rust
-use rspacefs_core::OverlayFS;
+use rspacefs_core::LayerFS;
 use vfs::{PhysicalFS, VfsPath};
 
 let upper = VfsPath::new(PhysicalFS::new("/var/lib/myapp/upper".into()));
@@ -50,7 +50,7 @@ let base  = VfsPath::new(PhysicalFS::new("/var/lib/myapp/base".into()));
 let app   = VfsPath::new(PhysicalFS::new("/var/lib/myapp/app".into()));
 
 // Lower layers ordered top-down: index 0 = highest priority.
-let root: VfsPath = OverlayFS::new(upper, vec![app, base]).into();
+let root: VfsPath = LayerFS::new(upper, vec![app, base]).into();
 
 // Use `root` as a regular merged filesystem.
 ```
@@ -58,7 +58,7 @@ let root: VfsPath = OverlayFS::new(upper, vec![app, base]).into();
 ### Library — verified read-only layer beneath an overlay
 
 ```rust
-use rspacefs_core::OverlayFS;
+use rspacefs_core::LayerFS;
 use rspacefs_verity::{VerifiedFS, OnFailure};
 use vfs::{MemoryFS, PhysicalFS, VfsPath};
 
@@ -67,7 +67,7 @@ let base_verified: VfsPath =
     VerifiedFS::build(base, OnFailure::Reject).unwrap().into();
 
 let upper: VfsPath = MemoryFS::new().into();
-let root: VfsPath = OverlayFS::new(upper, vec![base_verified]).into();
+let root: VfsPath = LayerFS::new(upper, vec![base_verified]).into();
 
 // Reads through `root` are tamper-evident. Writes go to `upper`.
 ```
@@ -123,7 +123,7 @@ binary compiles to a stub that errors out at runtime.
 ```
 rspacefs/
 ├── crates/
-│   ├── rspacefs-core/     # OverlayFS impl
+│   ├── rspacefs-core/     # LayerFS impl
 │   ├── rspacefs-verity/   # Merkle / verity impl
 │   ├── rspacefs-cli/      # `rspacefs` CLI binary
 │   └── rspacefs-fuse/     # `rspacefs-mount` FUSE daemon (Linux)

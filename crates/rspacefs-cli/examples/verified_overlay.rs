@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 
-use rspacefs_core::OverlayFS;
+use rspacefs_core::LayerFS;
 use rspacefs_verity::{OnFailure, VerifiedFS};
 use vfs::{MemoryFS, VfsPath};
 
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 3. Stack a writable upper layer on top.
     let upper: VfsPath = MemoryFS::new().into();
-    let overlay: VfsPath = OverlayFS::new(upper, vec![verified_path]).into();
+    let overlay: VfsPath = LayerFS::new(upper, vec![verified_path]).into();
 
     // ── 4. Read through the merged view — verity verifies each block.
     let mut buf = String::new();
