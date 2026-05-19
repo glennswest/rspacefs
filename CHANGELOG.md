@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### 2026-05-19 (later still)
+- **feat (fuse):** Streaming reads. Read-only opens now hold a `Box<dyn vfs::SeekAndRead + Send>` and seek+read at offset, instead of reading the whole file into a per-handle buffer on `open()`. Writable opens stay buffered (read-modify-write inside a file needs the buffer). Huge memory win for large lower-layer files (shared libs, binaries). Verified lowers still buffer internally (VerifiedFS produces a `Cursor` over the verified bytes) — that's a VerifiedFS limitation; the FUSE layer no longer adds its own duplicate buffer on top.
+- **feat (fuse):** Extended attributes — `getxattr`, `listxattr`, `setxattr`, `removexattr`. Implemented via the `xattr` crate against the physical backing file, side-channelling the vfs trait the same way mode bits already did. Write-side ops trigger an automatic copy-up into upper (`ensure_in_upper`) that preserves content, mode, AND xattrs from the source layer. Container-runtime requirement for SELinux contexts and POSIX capabilities to survive `pivot_root`.
+- **feat (fuse):** Reflink copy-up via `FICLONE` ioctl. On btrfs / xfs / bcachefs (any FS with the kernel reflink interface) the upper-side copy is an instant COW reference instead of a full byte copy. Silent fallback to `std::fs::copy` on filesystems without reflink (ext4 etc.) — best-effort speed-up, never a hard requirement.
+- **feat (core):** Re-export `WHITEOUT_PREFIX` and `OPAQUE_WHITEOUT` constants from the crate root so external code can build / detect whiteout markers without re-deriving the strings.
+- **examples:** `overlay_mount` and `verity_build` examples — runnable demos of layer merge / whiteout / copy-up and Merkle tree build / serialize / tamper-detect.
+
 ### 2026-05-19 (later)
 - **feat (fuse):** Symlink support. `rspacefs-mount` now implements the FUSE `readlink` and `symlink` operations and reports symlinks AS symlinks (not as their targets) in `lookup` / `getattr` / `readdir`. The vfs trait has no symlink methods, so the FUSE adapter bypasses it: `readlink` calls `std::fs::read_link` on the resolved physical path; `symlink` writes a real symlink into the upper layer via `std::os::unix::fs::symlink` (and removes any whiteout that would have masked it). Container images that rely on classic Unix symlinks (e.g. `/sbin → /usr/sbin`) now work through the mount.
 - **feat (verity):** `VerifiedFS::load_pinned(inner, manifest_json, tree_bin, on_failure)` — load a previously-built Merkle tree + manifest from disk instead of rebuilding from current content. This is the path you want for real tamper-evidence: build the manifest once at image-build time, ship it alongside the layer, load on mount. Manifest and tree must agree on `root_hash` (verified at load).

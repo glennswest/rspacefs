@@ -50,4 +50,4 @@
 
 mod layer;
 
-pub use layer::LayerFS;
+pub use layer::{LayerFS, OPAQUE_WHITEOUT, WHITEOUT_PREFIX};

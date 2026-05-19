@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -75,12 +75,26 @@ pub struct RspacefsFuse {
     mount_time: SystemTime,
 }
 
-struct OpenFile {
-    path: String,
-    /// Cached content (read in on open; written back on release if dirty).
-    data: Vec<u8>,
-    dirty: bool,
-    writable: bool,
+/// Per-open-file state. Two flavors:
+///
+/// - `Streaming`: read-only opens. Holds a `SeekAndRead` handle from the
+///   overlay; `read(offset, size)` does seek+read, no whole-file buffer.
+/// - `Buffered`: writable opens. Reads file content into memory at open
+///   time, mutates the buffer on `write`, flushes on `release`.
+///
+/// Writable opens stay buffered because (a) partial writes need read-
+/// modify-write inside a file, and (b) the vfs trait doesn't expose an
+/// open-for-rw mode.
+enum OpenFile {
+    Streaming {
+        reader: Box<dyn vfs::SeekAndRead + Send>,
+    },
+    Buffered {
+        path: String,
+        data: Vec<u8>,
+        dirty: bool,
+        writable: bool,
+    },
 }
 
 impl RspacefsFuse {
@@ -228,6 +242,69 @@ impl RspacefsFuse {
 
     fn alloc_fh(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Ensure `path` exists in the upper layer with its content + POSIX
+    /// metadata + extended attributes copied up from whichever lower
+    /// currently holds it. Returns the absolute upper-layer path.
+    ///
+    /// Used by xattr-write ops (setxattr/removexattr) and (in the future)
+    /// other ops that need to mutate metadata without going through LayerFS's
+    /// content-only `copy_up`. Uses `cp --reflink=auto` semantics: tries
+    /// reflink first (instant on btrfs/xfs), falls back to a real copy.
+    fn ensure_in_upper(&self, path: &str) -> Result<PathBuf, i32> {
+        let upper_path = self.layers[0].join(path);
+        if upper_path.symlink_metadata().is_ok() {
+            return Ok(upper_path);
+        }
+        let source = self.physical_for(path).ok_or(ENOENT)?;
+        let source_meta = source.symlink_metadata().map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+
+        // Ensure parent dirs in upper.
+        if let Some(parent_dir) = upper_path.parent() {
+            std::fs::create_dir_all(parent_dir).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        }
+
+        // Copy the file: reflink first (instant on btrfs/xfs/apfs), fall back to a
+        // byte copy. For symlinks, recreate the link. Both preserve content; the
+        // helper below handles xattrs + mode after the fact.
+        if source_meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&source).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+            std::os::unix::fs::symlink(&target, &upper_path)
+                .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        } else if source_meta.file_type().is_dir() {
+            std::fs::create_dir(&upper_path).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        } else {
+            copy_with_reflink(&source, &upper_path).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        }
+
+        // Preserve mode (don't touch symlinks — they don't have a mode of
+        // their own that matters).
+        if !source_meta.file_type().is_symlink() {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(source_meta.mode());
+            let _ = std::fs::set_permissions(&upper_path, perms);
+        }
+
+        // Preserve xattrs.
+        if let Ok(iter) = xattr::list(&source) {
+            for name in iter {
+                if let Ok(Some(val)) = xattr::get(&source, &name) {
+                    let _ = xattr::set(&upper_path, &name, &val);
+                }
+            }
+        }
+
+        // Remove any whiteout marker for this path.
+        let (parent, basename) = split_parent_name(path).unwrap_or(("", path));
+        let mut wh = self.layers[0].clone();
+        if !parent.is_empty() {
+            wh.push(parent);
+        }
+        wh.push(format!("{}{}", WHITEOUT_PREFIX, basename));
+        let _ = std::fs::remove_file(&wh);
+
+        Ok(upper_path)
     }
 }
 
@@ -451,34 +528,47 @@ impl Filesystem for RspacefsFuse {
             Ok(v) => v,
             Err(_) => return reply.error(EIO),
         };
+        if !p.exists().unwrap_or(false) {
+            return reply.error(ENOENT);
+        }
 
         let accmode = flags & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
 
-        // Read full file content into the handle cache. Empty for write-only
-        // O_TRUNC opens — kernel doesn't expect the prior content.
-        let mut data = Vec::new();
-        if !p.exists().unwrap_or(false) {
-            return reply.error(ENOENT);
-        }
-        if (flags & libc::O_TRUNC) == 0 {
-            if let Ok(mut f) = p.open_file() {
-                if f.read_to_end(&mut data).is_err() {
-                    return reply.error(EIO);
+        let fh = self.alloc_fh();
+
+        if writable {
+            // Read into buffer; partial writes need read-modify-write.
+            let mut data = Vec::new();
+            if (flags & libc::O_TRUNC) == 0 {
+                if let Ok(mut f) = p.open_file() {
+                    if f.read_to_end(&mut data).is_err() {
+                        return reply.error(EIO);
+                    }
                 }
+            }
+            self.open_files.insert(
+                fh,
+                OpenFile::Buffered {
+                    path,
+                    data,
+                    dirty: false,
+                    writable: true,
+                },
+            );
+        } else {
+            // Read-only: stream from a SeekAndRead handle. No whole-file
+            // copy in memory. (For verified lowers, the SeekAndRead is
+            // already a Cursor over the verified bytes — still in memory
+            // there, but at least it's not duplicated by us.)
+            match p.open_file() {
+                Ok(reader) => {
+                    self.open_files.insert(fh, OpenFile::Streaming { reader });
+                }
+                Err(_) => return reply.error(EIO),
             }
         }
 
-        let fh = self.alloc_fh();
-        self.open_files.insert(
-            fh,
-            OpenFile {
-                path,
-                data,
-                dirty: false,
-                writable,
-            },
-        );
         reply.opened(fh, 0);
     }
 
@@ -493,15 +583,32 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let Some(file) = self.open_files.get(&fh) else {
+        let Some(file) = self.open_files.get_mut(&fh) else {
             return reply.error(EBADF);
         };
-        let start = offset as usize;
-        if start >= file.data.len() {
-            return reply.data(&[]);
+        match file {
+            OpenFile::Streaming { reader } => {
+                if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
+                    return reply.error(EIO);
+                }
+                let mut buf = vec![0u8; size as usize];
+                match reader.read(&mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        reply.data(&buf);
+                    }
+                    Err(_) => reply.error(EIO),
+                }
+            }
+            OpenFile::Buffered { data, .. } => {
+                let start = offset as usize;
+                if start >= data.len() {
+                    return reply.data(&[]);
+                }
+                let end = (start + size as usize).min(data.len());
+                reply.data(&data[start..end]);
+            }
         }
-        let end = (start + size as usize).min(file.data.len());
-        reply.data(&file.data[start..end]);
     }
 
     fn write(
@@ -519,17 +626,22 @@ impl Filesystem for RspacefsFuse {
         let Some(file) = self.open_files.get_mut(&fh) else {
             return reply.error(EBADF);
         };
-        if !file.writable {
-            return reply.error(libc::EACCES);
+        match file {
+            OpenFile::Streaming { .. } => reply.error(libc::EACCES),
+            OpenFile::Buffered { data: buf, dirty, writable, .. } => {
+                if !*writable {
+                    return reply.error(libc::EACCES);
+                }
+                let off = offset as usize;
+                let end = off + data.len();
+                if end > buf.len() {
+                    buf.resize(end, 0);
+                }
+                buf[off..end].copy_from_slice(data);
+                *dirty = true;
+                reply.written(data.len() as u32);
+            }
         }
-        let off = offset as usize;
-        let end = off + data.len();
-        if end > file.data.len() {
-            file.data.resize(end, 0);
-        }
-        file.data[off..end].copy_from_slice(data);
-        file.dirty = true;
-        reply.written(data.len() as u32);
     }
 
     fn release(
@@ -545,20 +657,25 @@ impl Filesystem for RspacefsFuse {
         let Some(file) = self.open_files.remove(&fh) else {
             return reply.error(EBADF);
         };
-        if file.dirty {
-            let p = match self.root.join(&file.path) {
-                Ok(v) => v,
-                Err(_) => return reply.error(EIO),
-            };
-            let mut w = match p.create_file() {
-                Ok(w) => w,
-                Err(_) => return reply.error(EIO),
-            };
-            if w.write_all(&file.data).is_err() || w.flush().is_err() {
-                return reply.error(EIO);
+        match file {
+            OpenFile::Streaming { .. } => reply.ok(),
+            OpenFile::Buffered { path, data, dirty, .. } => {
+                if dirty {
+                    let p = match self.root.join(&path) {
+                        Ok(v) => v,
+                        Err(_) => return reply.error(EIO),
+                    };
+                    let mut w = match p.create_file() {
+                        Ok(w) => w,
+                        Err(_) => return reply.error(EIO),
+                    };
+                    if w.write_all(&data).is_err() || w.flush().is_err() {
+                        return reply.error(EIO);
+                    }
+                }
+                reply.ok();
             }
         }
-        reply.ok();
     }
 
     fn create(
@@ -604,7 +721,7 @@ impl Filesystem for RspacefsFuse {
         let fh = self.alloc_fh();
         self.open_files.insert(
             fh,
-            OpenFile {
+            OpenFile::Buffered {
                 path,
                 data: Vec::new(),
                 dirty: false,
@@ -758,6 +875,120 @@ impl Filesystem for RspacefsFuse {
         }
     }
 
+    // ── Extended attributes ─────────────────────────────────────────────────
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        let path = match self.path_of(ino) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        let phys = match self.physical_for(&path) {
+            Some(p) => p,
+            None => return reply.error(ENOENT),
+        };
+        match xattr::get(&phys, name) {
+            Ok(Some(val)) => {
+                if size == 0 {
+                    reply.size(val.len() as u32);
+                } else if (size as usize) < val.len() {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&val);
+                }
+            }
+            Ok(None) => reply.error(libc::ENODATA),
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn listxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        let path = match self.path_of(ino) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        let phys = match self.physical_for(&path) {
+            Some(p) => p,
+            None => return reply.error(ENOENT),
+        };
+        match xattr::list(&phys) {
+            Ok(iter) => {
+                // FUSE expects a NUL-separated, NUL-terminated list of names.
+                let mut buf = Vec::new();
+                for name in iter {
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.push(0);
+                }
+                if size == 0 {
+                    reply.size(buf.len() as u32);
+                } else if (size as usize) < buf.len() {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&buf);
+                }
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let path = match self.path_of(ino) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        // xattr writes need a writable target; ensure the file is in upper.
+        let upper = match self.ensure_in_upper(&path) {
+            Ok(p) => p,
+            Err(errno) => return reply.error(errno),
+        };
+        match xattr::set(&upper, name, value) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        let path = match self.path_of(ino) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        let upper = match self.ensure_in_upper(&path) {
+            Ok(p) => p,
+            Err(errno) => return reply.error(errno),
+        };
+        match xattr::remove(&upper, name) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
     // ── Statfs ──────────────────────────────────────────────────────────────
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
@@ -806,6 +1037,35 @@ fn ctime_or_default(m: &std::fs::Metadata, fallback: SystemTime) -> SystemTime {
     UNIX_EPOCH
         .checked_add(Duration::new(sec as u64, nsec as u32))
         .unwrap_or(fallback)
+}
+
+/// Copy a regular file from `src` to `dst`, preferring a reflink
+/// (copy-on-write) on filesystems that support it. Falls back to a
+/// byte-level `std::fs::copy` if reflink isn't supported (ext4, etc.).
+///
+/// Linux's `ioctl_ficlone` is the kernel API for reflinks (btrfs, xfs ≥
+/// 5.x with reflink=1, bcachefs, apfs via macOS reflink). Failure returns
+/// `EINVAL` or `ENOTTY` on filesystems that don't support it; we silently
+/// fall back.
+fn copy_with_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // FICLONE = _IOW(0x94, 9, int)
+    const FICLONE: libc::c_ulong = 0x40049409;
+
+    let src_f = std::fs::File::open(src)?;
+    let dst_f = std::fs::File::create(dst)?;
+    let ret = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE, src_f.as_raw_fd()) };
+    if ret == 0 {
+        return Ok(());
+    }
+    // Reflink unsupported — drop the empty dst we just created and do
+    // a regular copy.
+    drop(src_f);
+    drop(dst_f);
+    let _ = std::fs::remove_file(dst);
+    std::fs::copy(src, dst)?;
+    Ok(())
 }
 
 // Silence unused-import warnings on uncommon configurations.

@@ -26,3 +26,4 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { workspace = true }
 libc = { workspace = true }
+xattr = { workspace = true }

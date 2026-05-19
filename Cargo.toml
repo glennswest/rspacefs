@@ -27,3 +27,4 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 fuser = { version = "0.15", default-features = false }
 libc = "0.2"
+xattr = "1.5"
