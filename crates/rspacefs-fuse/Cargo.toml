@@ -1,0 +1,28 @@
+[package]
+name = "rspacefs-fuse"
+description = "Mount an OverlayFS-style upper+lowers as a FUSE filesystem. End-user binary backed by rspacefs-core; pairs with rspacefs-verity for tamper-evident lowers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rspacefs-mount"
+path = "src/main.rs"
+
+[dependencies]
+rspacefs-core = { path = "../rspacefs-core" }
+rspacefs-verity = { path = "../rspacefs-verity" }
+vfs = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# FUSE only on Linux. macOS would need macFUSE + non-default fuser features;
+# the rspacefs-mount binary is a Linux-target deliverable.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true }
+libc = { workspace = true }

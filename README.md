@@ -10,6 +10,7 @@ container rootfs assembly that previously required kernel modules:
 | `rspacefs-core`    | Userspace OverlayFS — merge N read-only lower layers with a writable upper layer, OCI whiteouts, copy-up. |
 | `rspacefs-verity`  | Userspace dm-verity — SHA-256 Merkle tree over 4 KB blocks, per-file manifest, verified-block cache.      |
 | `rspacefs-cli`     | `rspacefs` command-line tool — `overlay ls/cat/stat`, `verity build/verify/inspect`.                      |
+| `rspacefs-fuse`    | `rspacefs-mount` Linux daemon — exposes an overlay (with optional verified lowers) as a real FUSE mount. |
 
 Both crates expose plain synchronous APIs on top of the
 [`vfs`](https://crates.io/crates/vfs) trait, so you can plug in any backend
@@ -71,7 +72,7 @@ let root: VfsPath = OverlayFS::new(upper, vec![base_verified]).into();
 // Reads through `root` are tamper-evident. Writes go to `upper`.
 ```
 
-### CLI
+### CLI — inspect / build / verify
 
 ```sh
 # Inspect a merged overlay
@@ -90,6 +91,33 @@ rspacefs verity verify ./base --manifest base.manifest.json
 rspacefs verity inspect base.manifest.json
 ```
 
+### `rspacefs-mount` — real FUSE mount (Linux)
+
+```sh
+# Plain overlay
+sudo rspacefs-mount \
+  --upper /var/lib/myapp/upper \
+  --lower /var/lib/myapp/app \
+  --lower /var/lib/myapp/base \
+  /mnt/myroot
+
+# Overlay with a verity-protected base
+sudo rspacefs-mount \
+  --upper /var/lib/myapp/upper \
+  --lower-verified /var/lib/myapp/base \
+  --lower /var/lib/myapp/app \
+  /mnt/myroot
+
+# Stop: fusermount -u /mnt/myroot   (or just kill the foreground process)
+```
+
+The binary runs in the foreground, supervises the FUSE channel, and exits
+cleanly on `fusermount -u` or signal. `--auto-unmount` is on by default so
+crashes don't leave a half-attached mount.
+
+Build requires Linux. On a Mac dev box the workspace still builds — the
+binary compiles to a stub that errors out at runtime.
+
 ## Workspace layout
 
 ```
@@ -97,9 +125,8 @@ rspacefs/
 ├── crates/
 │   ├── rspacefs-core/     # OverlayFS impl
 │   ├── rspacefs-verity/   # Merkle / verity impl
-│   └── rspacefs-cli/      # `rspacefs` CLI binary
-├── examples/              # short stand-alone usage examples
-└── tests/                 # integration tests across crates
+│   ├── rspacefs-cli/      # `rspacefs` CLI binary
+│   └── rspacefs-fuse/     # `rspacefs-mount` FUSE daemon (Linux)
 ```
 
 ## Build & test

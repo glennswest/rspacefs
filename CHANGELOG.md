@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 2026-05-19
+- **feat:** `rspacefs-fuse` crate (binary: `rspacefs-mount`). Real Linux FUSE mount of an `OverlayFS` (with optional verity-protected lowers). Implements lookup, getattr, setattr, readdir, mkdir, rmdir, open, read, write, release, create, unlink, rename, statfs — enough for container rootfs use cases like podman/CRI-O. `fuser` and `libc` deps are gated to `cfg(target_os = "linux")` so the workspace still builds on Mac dev boxes (the binary compiles to a stub that errors at runtime with a clear message). Build the real binary on a Linux host: `cargo build -p rspacefs-fuse`.
+
 ## [v0.1.0] — 2026-05-19
 
 ### Added

@@ -28,6 +28,7 @@ networking) but does use `std` for file I/O via the `vfs` crate.
 | `rspacefs-core`    | `crates/rspacefs-core/`    | ~1030 | OverlayFS impl: upper + N lower layers, OCI whiteouts, copy-up.         |
 | `rspacefs-verity`  | `crates/rspacefs-verity/`  | ~1390 | SHA-256 Merkle tree, layer manifest, verified-block cache, verified FS. |
 | `rspacefs-cli`     | `crates/rspacefs-cli/`     | ~250  | `rspacefs` binary: `overlay {ls,cat,stat}`, `verity {build,verify,inspect}`. |
+| `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | ~500  | `rspacefs-mount` Linux daemon: real FUSE mount of an OverlayFS, with optional verified lowers. Stub binary on non-Linux. |
 
 Both library crates implement `vfs::FileSystem` and compose freely — a
 verified read-only layer can be a lower layer of an overlay, an overlay
@@ -38,10 +39,35 @@ can be a lower layer of another overlay, etc.
 `rspacefs-core` — only `vfs`.
 `rspacefs-verity` — `vfs`, `sha2`, `serde`, `serde_json`, `tracing`.
 `rspacefs-cli` — both library crates plus `clap`, `anyhow`.
+`rspacefs-fuse` — both library crates plus `fuser`, `libc`, `clap`, `anyhow`,
+`tracing-subscriber`. `fuser` and `libc` are gated by
+`cfg(target_os = "linux")`; on macOS the workspace still builds and
+produces a stub binary that errors at runtime.
 
 The verity crate's tests also dev-depend on `rspacefs-core` for the
 "verified layer beneath overlay" cross-test, which proves the two crates
 compose correctly.
+
+### Building rspacefs-fuse
+
+`fuser` 0.15 has a build-script that panics when host OS is non-Linux
+(uses `cfg!(target_os)` in build.rs against host, not target). That means:
+
+- **macOS** — `cargo build --workspace` works; the fuse crate compiles a stub.
+  Cross-compiling to Linux from a Mac fails inside fuser's build.rs.
+- **Linux host** — `cargo build --workspace` builds everything including
+  the real FUSE mount binary. Default `fuser` features = `["libfuse"]`,
+  but we disable defaults at the workspace level (`default-features = false`),
+  so fuser uses its pure-Rust mount path on Linux. No system libfuse needed
+  at build time; only `/dev/fuse` access at runtime.
+
+To build the FUSE binary, copy/clone the repo onto a Linux host (e.g.,
+`test1.g8.lo`) and run:
+
+```sh
+cargo build --release -p rspacefs-fuse
+# → target/release/rspacefs-mount
+```
 
 ## Cross-project relationship
 
