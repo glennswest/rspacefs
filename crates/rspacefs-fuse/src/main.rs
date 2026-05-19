@@ -18,7 +18,7 @@ mod fs;
 mod linux_main {
     use std::path::PathBuf;
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{anyhow, bail, Context, Result};
     use clap::Parser;
     use fuser::MountOption;
     use rspacefs_core::LayerFS;
@@ -26,6 +26,33 @@ mod linux_main {
     use vfs::{PhysicalFS, VfsPath};
 
     use crate::fs::RspacefsFuse;
+
+    /// A `--lower-verified-pinned DIR=MANIFEST=TREE` triple.
+    #[derive(Clone, Debug)]
+    pub struct PinnedVerified {
+        pub dir: PathBuf,
+        pub manifest: PathBuf,
+        pub tree: PathBuf,
+    }
+
+    fn parse_pinned_verified(s: &str) -> Result<PinnedVerified, String> {
+        let parts: Vec<&str> = s.split('=').collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "expected DIR=MANIFEST=TREE; got {} part(s) in {:?}",
+                parts.len(),
+                s
+            ));
+        }
+        Ok(PinnedVerified {
+            dir: PathBuf::from(parts[0]),
+            manifest: PathBuf::from(parts[1]),
+            tree: PathBuf::from(parts[2]),
+        })
+    }
+
+    // Silence the unused-import warning when anyhow!() isn't used elsewhere.
+    const _: fn() -> anyhow::Error = || anyhow!("unused");
 
     #[derive(Parser)]
     #[command(
@@ -44,10 +71,20 @@ mod linux_main {
         #[arg(long, value_name = "DIR")]
         lower: Vec<PathBuf>,
 
-        /// Read-only lower layer wrapped in verity verification. Tampered or
-        /// modified files in this directory cause reads to fail.
+        /// Read-only lower layer wrapped in verity verification. The Merkle
+        /// tree is **rebuilt from current contents at mount time** — only
+        /// useful for detecting tampering that happens AFTER the mount.
+        /// For real tamper-evidence use `--lower-verified-pinned` with a
+        /// manifest produced at image-build time.
         #[arg(long, value_name = "DIR")]
         lower_verified: Vec<PathBuf>,
+
+        /// Read-only lower layer with a pre-built (pinned) verity manifest +
+        /// tree from disk. Tampering of the underlying files between the
+        /// manifest's build time and the mount is detected on first read.
+        /// Format: `DIR=MANIFEST.json=TREE.bin`. Repeatable.
+        #[arg(long, value_name = "DIR=MFS=TREE", value_parser = parse_pinned_verified)]
+        lower_verified_pinned: Vec<PinnedVerified>,
 
         /// Mountpoint (must be an existing empty directory).
         mountpoint: PathBuf,
@@ -84,12 +121,26 @@ mod linux_main {
         if !cli.upper.is_dir() {
             bail!("upper layer is not a directory: {}", cli.upper.display());
         }
-        if cli.lower.is_empty() && cli.lower_verified.is_empty() {
-            bail!("at least one --lower or --lower-verified is required");
+        if cli.lower.is_empty()
+            && cli.lower_verified.is_empty()
+            && cli.lower_verified_pinned.is_empty()
+        {
+            bail!("at least one --lower / --lower-verified / --lower-verified-pinned is required");
         }
         for l in cli.lower.iter().chain(cli.lower_verified.iter()) {
             if !l.is_dir() {
                 bail!("lower layer is not a directory: {}", l.display());
+            }
+        }
+        for p in &cli.lower_verified_pinned {
+            if !p.dir.is_dir() {
+                bail!("pinned lower is not a directory: {}", p.dir.display());
+            }
+            if !p.manifest.is_file() {
+                bail!("manifest not found: {}", p.manifest.display());
+            }
+            if !p.tree.is_file() {
+                bail!("tree not found: {}", p.tree.display());
             }
         }
         if !cli.mountpoint.is_dir() {
@@ -101,11 +152,29 @@ mod linux_main {
 
         let upper = VfsPath::new(PhysicalFS::new(cli.upper.clone()));
 
-        // Verified lowers go first (highest priority) — typical use is the
-        // base image is verified and the app layer on top is not. Pass
-        // multiple `--lower` flags if you need a different order.
+        // Layer priority: pinned-verified first (highest priority and most
+        // trustworthy), then dynamic-verified (rebuilt at mount time), then
+        // plain lowers. All physical-layer paths tracked for the FUSE
+        // metadata side-channel.
         let mut lowers: Vec<VfsPath> = Vec::new();
         let mut physical_layers: Vec<std::path::PathBuf> = vec![cli.upper.clone()];
+        for p in &cli.lower_verified_pinned {
+            let path = VfsPath::new(PhysicalFS::new(p.dir.clone()));
+            let verified = VerifiedFS::load_pinned(
+                path,
+                &p.manifest,
+                &p.tree,
+                OnFailure::Reject,
+            )
+            .context(format!(
+                "loading pinned verity manifest for {} (manifest={}, tree={})",
+                p.dir.display(),
+                p.manifest.display(),
+                p.tree.display(),
+            ))?;
+            lowers.push(verified.into());
+            physical_layers.push(p.dir.clone());
+        }
         for l in &cli.lower_verified {
             let path = VfsPath::new(PhysicalFS::new(l.clone()));
             let verified = VerifiedFS::build(path, OnFailure::Reject).context(
@@ -122,7 +191,8 @@ mod linux_main {
         tracing::info!(
             mountpoint = %cli.mountpoint.display(),
             upper = %cli.upper.display(),
-            verified_layers = cli.lower_verified.len(),
+            pinned_verified_layers = cli.lower_verified_pinned.len(),
+            dynamic_verified_layers = cli.lower_verified.len(),
             plain_layers = cli.lower.len(),
             "starting rspacefs FUSE mount"
         );

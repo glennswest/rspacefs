@@ -687,9 +687,45 @@ impl VerifiedFS {
         }
     }
 
-    /// Build a VerifiedFS by scanning a VFS directory tree.
+    /// Build a VerifiedFS by scanning a VFS directory tree. The Merkle tree
+    /// and manifest are computed from the **current** contents of `inner` —
+    /// tampering that occurred before this call goes undetected. For real
+    /// tamper resistance use [`VerifiedFS::load_pinned`] with a manifest
+    /// produced earlier (e.g. by `rspacefs verity build` at image-build time).
     pub fn build(inner: VfsPath, on_failure: OnFailure) -> io::Result<Self> {
         let verified = VerifiedLayerVfs::build(inner, on_failure)?;
+        Ok(Self::new(verified))
+    }
+
+    /// Build a VerifiedFS from a pre-built manifest and Merkle tree on disk.
+    ///
+    /// `manifest_json` is the JSON output of `MerkleTree::build_from_vfs(...)`
+    /// (or `rspacefs verity build`). `tree_bin` is the binary tree from
+    /// `MerkleTree::to_bytes()`. The two MUST agree on root hash.
+    ///
+    /// Use this instead of [`VerifiedFS::build`] for any tamper-evidence
+    /// guarantee: pinning the manifest/tree to disk freezes the trust anchor
+    /// at production time. Subsequent tampering of `inner` is detected on
+    /// every uncached block read.
+    pub fn load_pinned(
+        inner: VfsPath,
+        manifest_json: &std::path::Path,
+        tree_bin: &std::path::Path,
+        on_failure: OnFailure,
+    ) -> io::Result<Self> {
+        let mf_text = std::fs::read_to_string(manifest_json)?;
+        let manifest: LayerManifest = serde_json::from_str(&mf_text)
+            .map_err(|e| io::Error::other(format!("parsing manifest: {e}")))?;
+        let tree_bytes = std::fs::read(tree_bin)?;
+        let tree = MerkleTree::from_bytes(&tree_bytes)
+            .ok_or_else(|| io::Error::other("malformed Merkle tree binary"))?;
+        if tree.root_hash() != manifest.root_hash {
+            return Err(io::Error::other(
+                "manifest root_hash != tree root_hash — files don't match",
+            ));
+        }
+        let root_hash = manifest.root_hash;
+        let verified = VerifiedLayerVfs::new(inner, tree, manifest, root_hash, on_failure);
         Ok(Self::new(verified))
     }
 

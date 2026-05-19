@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -218,12 +219,11 @@ impl RspacefsFuse {
     }
 
     fn attr_for_path(&self, ino: u64, path: &str) -> Option<FileAttr> {
-        let p = self.root.join(path).ok()?;
-        if !p.exists().ok()? {
-            return None;
-        }
-        let m = p.metadata().ok()?;
-        Some(self.make_attr(ino, path, m.file_type, m.len))
+        // Skip the vfs `metadata()` (which follows symlinks). The make_attr
+        // implementation does its own symlink-preserving stat through
+        // physical_for; we just need to confirm existence first.
+        self.physical_for(path)?;
+        Some(self.make_attr(ino, path, VfsFileType::File, 0))
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -246,22 +246,15 @@ impl Filesystem for RspacefsFuse {
             return reply.error(EINVAL);
         };
 
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        match p.exists() {
-            Ok(true) => {}
-            Ok(false) => return reply.error(ENOENT),
-            Err(_) => return reply.error(EIO),
+        // Use the physical side-channel directly so symlinks are reported
+        // AS symlinks (vfs follows them; FUSE consumers expect them raw).
+        if self.physical_for(&path).is_none() {
+            return reply.error(ENOENT);
         }
-        let meta = match p.metadata() {
-            Ok(m) => m,
-            Err(_) => return reply.error(EIO),
-        };
 
         let ino = self.intern_path(path.clone());
-        let attr = self.make_attr(ino, &path, meta.file_type, meta.len);
+        // ft/size args ignored when physical_for succeeds (which we just verified).
+        let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -367,10 +360,13 @@ impl Filesystem for RspacefsFuse {
             } else {
                 format!("{}/{}", path, name)
             };
-            let kind = match self.root.join(&child_path).and_then(|p| p.metadata()) {
-                Ok(m) if m.file_type == VfsFileType::Directory => FileType::Directory,
-                Ok(_) => FileType::RegularFile,
-                Err(_) => FileType::RegularFile,
+            // Determine the entry kind via physical symlink_metadata so symlinks
+            // show as symlinks (not as their targets).
+            let kind = match self.physical_for(&child_path).and_then(|p| p.symlink_metadata().ok()) {
+                Some(m) if m.file_type().is_dir() => FileType::Directory,
+                Some(m) if m.file_type().is_symlink() => FileType::Symlink,
+                Some(_) => FileType::RegularFile,
+                None => FileType::RegularFile,
             };
             let child_ino = self.intern_path(child_path);
             all.push((child_ino, kind, name));
@@ -698,6 +694,67 @@ impl Filesystem for RspacefsFuse {
                 reply.ok();
             }
             Err(_) => reply.error(EIO),
+        }
+    }
+
+    // ── Symlinks ────────────────────────────────────────────────────────────
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let path = match self.path_of(ino) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        let phys = match self.physical_for(&path) {
+            Some(p) => p,
+            None => return reply.error(ENOENT),
+        };
+        match std::fs::read_link(&phys) {
+            Ok(target) => reply.data(target.as_os_str().as_bytes()),
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        link: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let parent_path = match self.path_of(parent) {
+            Some(p) => p.to_string(),
+            None => return reply.error(ENOENT),
+        };
+        let Some(path) = Self::join(&parent_path, name) else {
+            return reply.error(EINVAL);
+        };
+
+        // Symlinks always go into the upper layer (writable, index 0).
+        // First clear any whiteout marker on this path so the new symlink
+        // is visible to the merge view.
+        let mut wh = self.layers[0].clone();
+        if !parent_path.is_empty() {
+            wh.push(&parent_path);
+        }
+        wh.push(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
+        let _ = std::fs::remove_file(&wh);
+
+        // Ensure parent dirs exist in upper.
+        let upper_path = self.layers[0].join(&path);
+        if let Some(parent_dir) = upper_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent_dir) {
+                return reply.error(e.raw_os_error().unwrap_or(EIO));
+            }
+        }
+
+        match std::os::unix::fs::symlink(link, &upper_path) {
+            Ok(_) => {
+                let ino = self.intern_path(path.clone());
+                let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
     }
 
