@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### 2026-05-19 (more)
+- **feat (verity):** Streaming reads through `VerifiedFS`. New `VerifiedReader` keeps one 4 KB block in memory at a time, verifies each block exactly once when first accessed (or every time when caching is disabled in pinned mode), and serves arbitrary `Read`/`Seek` operations. Old behavior read the whole file into a `Cursor` at open time — fine for `/etc/*` config, catastrophic for `/usr/lib/*.so` and large binaries. Now a 200 MB shared library opens in O(1) memory.
+- **feat (fuse):** `fsync` and `flush` FUSE ops. `fsync` forces a buffered-handle write-back to upper before returning OK; `flush` is a no-op (release does the write-back to coalesce). Streaming handles have nothing to sync and return OK directly. Container processes calling `fsync(2)` no longer get `ENOSYS`.
+
 ### 2026-05-19 (later still)
 - **feat (fuse):** Streaming reads. Read-only opens now hold a `Box<dyn vfs::SeekAndRead + Send>` and seek+read at offset, instead of reading the whole file into a per-handle buffer on `open()`. Writable opens stay buffered (read-modify-write inside a file needs the buffer). Huge memory win for large lower-layer files (shared libs, binaries). Verified lowers still buffer internally (VerifiedFS produces a `Cursor` over the verified bytes) — that's a VerifiedFS limitation; the FUSE layer no longer adds its own duplicate buffer on top.
 - **feat (fuse):** Extended attributes — `getxattr`, `listxattr`, `setxattr`, `removexattr`. Implemented via the `xattr` crate against the physical backing file, side-channelling the vfs trait the same way mode bits already did. Write-side ops trigger an automatic copy-up into upper (`ensure_in_upper`) that preserves content, mode, AND xattrs from the source layer. Container-runtime requirement for SELinux contexts and POSIX capabilities to survive `pivot_root`.

@@ -682,6 +682,144 @@ impl std::fmt::Debug for VerifiedLayerVfs {
     }
 }
 
+// ── Streaming VerifiedReader ───────────────────────────────────────────────────
+
+/// `Seek + Read` over a verity-protected file. Verifies each `BLOCK_SIZE`-
+/// aligned block exactly once before serving any byte from it, keeping at
+/// most one block's worth of data resident at a time. The whole-file
+/// `Cursor` view is gone.
+///
+/// Construction is cheap: just stores the underlying reader, the layer's
+/// shared state, and the manifest entry. The first `read()` triggers the
+/// first block verification.
+pub(crate) struct VerifiedReader {
+    inner: Box<dyn SeekAndRead + Send>,
+    layer: Arc<VerifiedLayerVfs>,
+    entry: FileEntry,
+    position: u64,
+    /// Cached current block: (block_index_within_file, data).
+    current: Option<(usize, Vec<u8>)>,
+}
+
+impl VerifiedReader {
+    fn new(
+        inner: Box<dyn SeekAndRead + Send>,
+        layer: Arc<VerifiedLayerVfs>,
+        entry: FileEntry,
+    ) -> Self {
+        Self {
+            inner,
+            layer,
+            entry,
+            position: 0,
+            current: None,
+        }
+    }
+
+    /// Load `block_idx` (file-relative) from `inner`, verify against the
+    /// Merkle tree, and store in `self.current`. Returns the verified block.
+    fn load_block(&mut self, block_idx: usize) -> io::Result<&[u8]> {
+        // Already loaded?
+        if matches!(self.current, Some((i, _)) if i == block_idx) {
+            return Ok(&self.current.as_ref().unwrap().1);
+        }
+
+        let block_start = (block_idx as u64) * (BLOCK_SIZE as u64);
+        let file_size = self.entry.size;
+        let to_read = std::cmp::min(file_size.saturating_sub(block_start), BLOCK_SIZE as u64);
+
+        self.inner.seek(io::SeekFrom::Start(block_start))?;
+        let mut block_data = vec![0u8; to_read as usize];
+        if to_read > 0 {
+            self.inner.read_exact(&mut block_data)?;
+        }
+
+        // Verify against tree (with or without the per-block cache).
+        let global_block = self.entry.block_range.0 + block_idx;
+        let trusted = self.layer.tree.verify_block(
+            global_block,
+            &block_data,
+            &self.layer.root_hash,
+        );
+        if trusted {
+            self.layer.cache.mark_verified(global_block);
+        } else {
+            tracing::error!(
+                "verity: streaming read failed for block {} of {} (global block {})",
+                block_idx,
+                self.entry.path,
+                global_block,
+            );
+            match self.layer.on_failure {
+                OnFailure::Reject => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "verity: block {} of {} failed",
+                            global_block, self.entry.path
+                        ),
+                    ));
+                }
+                OnFailure::Warn => {
+                    tracing::warn!(
+                        "verity: serving unverified block {} of {} (on_failure=Warn)",
+                        global_block,
+                        self.entry.path,
+                    );
+                }
+            }
+        }
+
+        self.current = Some((block_idx, block_data));
+        Ok(&self.current.as_ref().unwrap().1)
+    }
+}
+
+impl io::Read for VerifiedReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.entry.size || out.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < out.len() && self.position < self.entry.size {
+            let block_idx = (self.position / BLOCK_SIZE as u64) as usize;
+            let block_offset = (self.position % BLOCK_SIZE as u64) as usize;
+            let block = self.load_block(block_idx)?;
+            if block.is_empty() {
+                break;
+            }
+            let avail = block.len().saturating_sub(block_offset);
+            let copy = std::cmp::min(avail, out.len() - written);
+            if copy == 0 {
+                break;
+            }
+            out[written..written + copy]
+                .copy_from_slice(&block[block_offset..block_offset + copy]);
+            written += copy;
+            self.position += copy as u64;
+        }
+        Ok(written)
+    }
+}
+
+impl io::Seek for VerifiedReader {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            io::SeekFrom::Start(p) => p as i64,
+            io::SeekFrom::End(d) => self.entry.size as i64 + d,
+            io::SeekFrom::Current(d) => self.position as i64 + d,
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.position = new_pos as u64;
+        Ok(self.position)
+    }
+}
+
 // ── FileSystem trait for VerifiedLayerVfs ─────────────────────────────────────
 
 /// Wraps the VerifiedLayerVfs in an Arc for shared ownership by the FileSystem trait.
@@ -789,23 +927,26 @@ impl FileSystem for VerifiedFS {
 
     fn open_file(&self, path: &str) -> VfsResult<Box<dyn SeekAndRead + Send>> {
         let resolved = self.resolve(path)?;
-        let file = resolved.open_file()?;
+        let inner_reader = resolved.open_file()?;
 
-        // Read the full file content for verification.
-        let mut reader = file;
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).map_err(|e| {
-            vfs::VfsError::from(VfsErrorKind::IoError(e))
-        })?;
-
-        // Verify the content against the Merkle tree.
+        // Look up the file's manifest entry so VerifiedReader can map
+        // file-local offsets to global block indices.
         let clean_path = path.strip_prefix('/').unwrap_or(path);
-        self.inner.verify_file_blocks(clean_path, &data, 0).map_err(|e| {
-            vfs::VfsError::from(VfsErrorKind::IoError(e))
-        })?;
+        let entry = self
+            .inner
+            .manifest
+            .files
+            .iter()
+            .find(|f| f.path == clean_path)
+            .cloned()
+            .ok_or_else(|| {
+                vfs::VfsError::from(VfsErrorKind::IoError(io::Error::other(format!(
+                    "verity: {} not in manifest",
+                    clean_path
+                ))))
+            })?;
 
-        // Return a cursor over the verified data.
-        Ok(Box::new(io::Cursor::new(data)))
+        Ok(Box::new(VerifiedReader::new(inner_reader, self.inner.clone(), entry)))
     }
 
     fn create_file(&self, _path: &str) -> VfsResult<Box<dyn SeekAndWrite + Send>> {

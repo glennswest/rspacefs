@@ -989,6 +989,60 @@ impl Filesystem for RspacefsFuse {
         }
     }
 
+    // ── Durable writes ──────────────────────────────────────────────────────
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // For Buffered (writable) handles: flush in-memory dirty data to
+        // the upper file now. Streaming (read-only) handles have nothing
+        // to sync — return OK.
+        let Some(file) = self.open_files.get_mut(&fh) else {
+            return reply.error(EBADF);
+        };
+        match file {
+            OpenFile::Streaming { .. } => reply.ok(),
+            OpenFile::Buffered { path, data, dirty, .. } => {
+                if !*dirty {
+                    return reply.ok();
+                }
+                let p = match self.root.join(path) {
+                    Ok(v) => v,
+                    Err(_) => return reply.error(EIO),
+                };
+                let mut w = match p.create_file() {
+                    Ok(w) => w,
+                    Err(_) => return reply.error(EIO),
+                };
+                if w.write_all(data).is_err() || w.flush().is_err() {
+                    return reply.error(EIO);
+                }
+                *dirty = false;
+                reply.ok();
+            }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        // Per POSIX: close() may flush; the kernel calls flush per close.
+        // We do the actual write-back in release() to coalesce, so flush
+        // is a no-op for our buffered model. Returning OK lets close()
+        // complete without spurious EIO.
+        reply.ok();
+    }
+
     // ── Statfs ──────────────────────────────────────────────────────────────
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
