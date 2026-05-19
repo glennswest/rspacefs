@@ -65,8 +65,11 @@ mod linux_main {
         #[arg(long)]
         allow_root: bool,
 
-        /// Auto-unmount when the mount process exits.
-        #[arg(long, default_value_t = true)]
+        /// Auto-unmount when the mount process exits. Note: enabling this
+        /// causes libfuse to also pass `allow_other`, which requires
+        /// `user_allow_other` in `/etc/fuse.conf`. Off by default; on signal
+        /// or daemon exit, run `fusermount3 -u <mountpoint>` manually.
+        #[arg(long)]
         auto_unmount: bool,
 
         /// Show debug-level FUSE op logs.
