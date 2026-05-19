@@ -462,6 +462,12 @@ pub struct VerifiedLayerVfs {
     root_hash: Hash256,
     /// Cache of already-verified blocks.
     cache: VerifiedBlockCache,
+    /// Whether to trust the verified-block cache after first check.
+    /// `true` (default) = fast — each block verified once per session.
+    /// `false` = strict — every read re-verifies. Set automatically by
+    /// `VerifiedFS::load_pinned`, since the pinned-manifest use case is
+    /// specifically about catching post-mount tampering.
+    cache_enabled: bool,
     /// Action on verification failure.
     on_failure: OnFailure,
 }
@@ -482,8 +488,16 @@ impl VerifiedLayerVfs {
             manifest,
             root_hash,
             cache,
+            cache_enabled: true,
             on_failure,
         }
+    }
+
+    /// Disable the verified-block cache. Every block read will re-hash and
+    /// re-walk the Merkle tree. Required for pinned-manifest tamper
+    /// resistance.
+    pub fn set_cache_enabled(&mut self, enabled: bool) {
+        self.cache_enabled = enabled;
     }
 
     /// Build a verified layer by scanning a VFS directory tree.
@@ -539,8 +553,10 @@ impl VerifiedLayerVfs {
         for i in 0..block_count {
             let global_block = first_block + i;
 
-            // Skip if already verified this session.
-            if self.cache.is_verified(global_block) {
+            // Skip if already verified this session — but only when caching
+            // is enabled. Pinned-manifest mode disables this so post-mount
+            // tampering is detected on every read.
+            if self.cache_enabled && self.cache.is_verified(global_block) {
                 continue;
             }
 
@@ -725,7 +741,12 @@ impl VerifiedFS {
             ));
         }
         let root_hash = manifest.root_hash;
-        let verified = VerifiedLayerVfs::new(inner, tree, manifest, root_hash, on_failure);
+        let mut verified = VerifiedLayerVfs::new(inner, tree, manifest, root_hash, on_failure);
+        // Pinned-manifest mode: disable verification cache so every read
+        // re-hashes against the tree. Catches post-mount tampering of the
+        // underlying files. The performance cost is acceptable for the
+        // tamper-evidence guarantee that's the entire reason for pinning.
+        verified.set_cache_enabled(false);
         Ok(Self::new(verified))
     }
 
