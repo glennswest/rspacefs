@@ -12,6 +12,8 @@
 //! `--auto-unmount` is on by default).
 
 #[cfg(target_os = "linux")]
+mod control;
+#[cfg(target_os = "linux")]
 mod fs;
 
 #[cfg(target_os = "linux")]
@@ -336,6 +338,14 @@ mod linux_main {
         /// Show debug-level FUSE op logs.
         #[arg(long)]
         debug: bool,
+
+        /// Path for an optional Unix-socket control surface. When set,
+        /// rspacefs-mount listens on this socket for newline-delimited JSON
+        /// commands (`status`, `invalidate`, `ping`, ...). Use `rspacefs ctl
+        /// --socket PATH <cmd>` to talk to it from a client. Without this
+        /// flag, no control surface is exposed.
+        #[arg(long, value_name = "PATH")]
+        control_socket: Option<PathBuf>,
     }
 
     pub fn run() -> Result<()> {
@@ -427,8 +437,12 @@ mod linux_main {
             "starting rspacefs FUSE mount"
         );
 
-        let overlay = LayerFS::new(upper, lowers);
-        let fs = RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
+        let layered_root: VfsPath = LayerFS::new(upper, lowers.clone()).into();
+        let fs = RspacefsFuse::new(
+            layered_root.clone(),
+            physical_layers.clone(),
+            verified_layers.clone(),
+        );
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName(cli.name.clone()),
@@ -445,8 +459,37 @@ mod linux_main {
             opts.push(MountOption::AutoUnmount);
         }
 
-        fuser::mount2(fs, &cli.mountpoint, &opts)
-            .context("FUSE mount failed (need /dev/fuse access?)")?;
+        // Branch: with control socket → spawn_mount2 + control thread + join.
+        // Without → mount2 (blocks until unmount; current behaviour).
+        match &cli.control_socket {
+            Some(sock_path) => {
+                let control_state = std::sync::Arc::new(crate::control::ControlState {
+                    mountpoint: cli.mountpoint.clone(),
+                    upper: cli.upper.clone(),
+                    lowers: physical_layers[1..].to_vec(),
+                    verified_layers: verified_layers.clone(),
+                    mount_time: std::time::SystemTime::now(),
+                    root: layered_root,
+                });
+                let session = fuser::spawn_mount2(fs, &cli.mountpoint, &opts)
+                    .context("FUSE mount failed (need /dev/fuse access?)")?;
+                let notifier = session.notifier();
+                let _ctl = crate::control::spawn_control_thread(
+                    sock_path.clone(),
+                    control_state,
+                    notifier,
+                )
+                .context("failed to start control socket")?;
+                // Block until the FUSE session ends (unmount).
+                session.join();
+                // Clean up the stale socket file on exit.
+                let _ = std::fs::remove_file(sock_path);
+            }
+            None => {
+                fuser::mount2(fs, &cli.mountpoint, &opts)
+                    .context("FUSE mount failed (need /dev/fuse access?)")?;
+            }
+        }
         Ok(())
     }
 

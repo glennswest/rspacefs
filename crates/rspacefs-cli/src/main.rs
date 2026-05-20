@@ -34,6 +34,27 @@ enum Cmd {
         #[command(subcommand)]
         op: VerityOp,
     },
+    /// Talk to a running `rspacefs-mount` daemon via its control socket.
+    Ctl {
+        /// Path to the daemon's control socket (matches `--control-socket`
+        /// passed to `rspacefs-mount`).
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+        #[command(subcommand)]
+        op: CtlOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum CtlOp {
+    /// Round-trip a `ping` request — confirms the daemon is alive.
+    Ping,
+    /// Print the daemon's mount state as JSON.
+    Status,
+    /// Invalidate the kernel's dentry cache for all top-level entries.
+    /// Forces the kernel to re-enter the daemon on next access; used after
+    /// a manifest rotation, layer swap, or other live-state change.
+    Invalidate,
 }
 
 #[derive(Subcommand)]
@@ -103,7 +124,38 @@ fn main() -> Result<()> {
     match cli.command {
         Cmd::Overlay { op } => run_overlay(op),
         Cmd::Verity { op } => run_verity(op),
+        Cmd::Ctl { socket, op } => run_ctl(socket, op),
     }
+}
+
+// ── ctl: talk to a running rspacefs-mount daemon ────────────────────────────
+
+fn run_ctl(socket: PathBuf, op: CtlOp) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let request = match op {
+        CtlOp::Ping => r#"{"cmd":"ping"}"#,
+        CtlOp::Status => r#"{"cmd":"status"}"#,
+        CtlOp::Invalidate => r#"{"cmd":"invalidate"}"#,
+    };
+
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("connecting to control socket {}", socket.display()))?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+
+    // Pretty-print JSON for readability.
+    match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        Err(_) => print!("{}", line),
+    }
+    Ok(())
 }
 
 // ── overlay subcommands ──────────────────────────────────────────────────────
