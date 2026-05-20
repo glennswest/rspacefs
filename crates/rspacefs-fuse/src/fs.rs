@@ -33,9 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    consts, BackingId, FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    consts, BackingId, FileAttr, FileType, Filesystem, KernelConfig, PollHandle,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY};
 use vfs::{VfsFileType, VfsPath};
@@ -1076,6 +1076,30 @@ impl Filesystem for RspacefsFuse {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
         }
+    }
+
+    // ── poll(2) ─────────────────────────────────────────────────────────────
+
+    fn poll(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _ph: PollHandle,
+        events: u32,
+        _flags: u32,
+        reply: ReplyPoll,
+    ) {
+        // Regular files and directories on a plain filesystem are *always*
+        // poll-ready in the POSIX sense — read() / write() don't block on
+        // them like they do on sockets / pipes / FIFOs. Echo back exactly
+        // the events the caller asked about so select(2) / poll(2) /
+        // epoll(2) all see "ready" and move on.
+        //
+        // This matches what tmpfs / ext4 / overlay would return for the
+        // same fds; container runtimes (notably crun / runc when probing
+        // /proc fds in the merged tree) expect this behaviour.
+        reply.poll(events);
     }
 
     // ── Durable writes ──────────────────────────────────────────────────────
