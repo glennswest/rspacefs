@@ -154,10 +154,13 @@ mod linux_main {
 
         // Layer priority: pinned-verified first (highest priority and most
         // trustworthy), then dynamic-verified (rebuilt at mount time), then
-        // plain lowers. All physical-layer paths tracked for the FUSE
-        // metadata side-channel.
+        // plain lowers. We also build a parallel `verified_layers` flag
+        // vector — the FUSE adapter uses it to decide which reads can be
+        // served via FUSE passthrough (non-verified) vs. must route through
+        // the daemon for block-by-block verity (verified).
         let mut lowers: Vec<VfsPath> = Vec::new();
         let mut physical_layers: Vec<std::path::PathBuf> = vec![cli.upper.clone()];
+        let mut verified_layers: Vec<bool> = vec![false]; // upper is writable, not verified
         for p in &cli.lower_verified_pinned {
             let path = VfsPath::new(PhysicalFS::new(p.dir.clone()));
             let verified = VerifiedFS::load_pinned(
@@ -174,6 +177,7 @@ mod linux_main {
             ))?;
             lowers.push(verified.into());
             physical_layers.push(p.dir.clone());
+            verified_layers.push(true);
         }
         for l in &cli.lower_verified {
             let path = VfsPath::new(PhysicalFS::new(l.clone()));
@@ -182,10 +186,12 @@ mod linux_main {
             )?;
             lowers.push(verified.into());
             physical_layers.push(l.clone());
+            verified_layers.push(true);
         }
         for l in &cli.lower {
             lowers.push(VfsPath::new(PhysicalFS::new(l.clone())));
             physical_layers.push(l.clone());
+            verified_layers.push(false);
         }
 
         tracing::info!(
@@ -198,7 +204,7 @@ mod linux_main {
         );
 
         let overlay = LayerFS::new(upper, lowers);
-        let fs = RspacefsFuse::new(VfsPath::new(overlay), physical_layers);
+        let fs = RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName(cli.name.clone()),

@@ -33,8 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    consts, BackingId, FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY};
 use vfs::{VfsFileType, VfsPath};
@@ -56,6 +57,12 @@ pub struct RspacefsFuse {
     /// `stat()` the real backing file for accurate FileAttr (mode bits, uid,
     /// gid, times, nlink, rdev). The `vfs` crate doesn't expose any of those.
     layers: Vec<PathBuf>,
+    /// Per-layer flag: `true` if this layer is verity-protected. Reads
+    /// targeting a verity-protected layer must go through the daemon (so
+    /// VerifiedFS hashes them); other reads can be served via FUSE
+    /// passthrough — the kernel reads the backing file directly with zero
+    /// daemon involvement.
+    verified_layers: Vec<bool>,
     /// inode → relative path (UTF-8 / `/`-separated, with "" for root).
     inodes: HashMap<u64, String>,
     /// path → inode (reverse, for stable allocation across lookups).
@@ -86,9 +93,19 @@ pub struct RspacefsFuse {
 /// modify-write inside a file, and (b) the vfs trait doesn't expose an
 /// open-for-rw mode.
 enum OpenFile {
+    /// Read-only open of a non-verified file. The kernel reads the backing
+    /// file directly via FUSE_PASSTHROUGH; our daemon never sees the
+    /// `read()` ops. We hold the BackingId here so its Drop fires
+    /// (BACKING_CLOSE) when `release` removes this entry.
+    Passthrough { _backing: BackingId },
+    /// Read-only open with daemon-mediated I/O. Used when the file resolves
+    /// to a verity-protected lower (so VerifiedFS hashes each block) or
+    /// when passthrough setup fails on older kernels.
     Streaming {
         reader: Box<dyn vfs::SeekAndRead + Send>,
     },
+    /// Writable open. Reads file into memory at open time, mutates the
+    /// buffer on `write`, flushes on `release`/`fsync`.
     Buffered {
         path: String,
         data: Vec<u8>,
@@ -105,7 +122,8 @@ impl RspacefsFuse {
     /// keep these as a side-channel so we can `stat()` the real backing file
     /// for an accurate FileAttr (mode bits, uid/gid, times, nlink) — the
     /// `vfs` crate's metadata trait throws all of that away.
-    pub fn new(root: VfsPath, layers: Vec<PathBuf>) -> Self {
+    pub fn new(root: VfsPath, layers: Vec<PathBuf>, verified_layers: Vec<bool>) -> Self {
+        debug_assert_eq!(layers.len(), verified_layers.len());
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
         inodes.insert(ROOT_INO, String::new());
@@ -113,6 +131,7 @@ impl RspacefsFuse {
         Self {
             root,
             layers,
+            verified_layers,
             inodes,
             paths,
             next_ino: ROOT_INO + 1,
@@ -151,10 +170,11 @@ impl RspacefsFuse {
         })
     }
 
-    /// Find the on-disk physical file backing a given overlay path by walking
-    /// layers in priority order. Returns the first existing path that isn't
-    /// shadowed by an entry-level whiteout in the upper layer.
-    fn physical_for(&self, path: &str) -> Option<PathBuf> {
+    /// Find the on-disk physical file backing a given overlay path. Walks
+    /// layers in priority order; returns the resolved physical path and the
+    /// layer index it came from. Honors entry-level whiteouts in the upper
+    /// layer.
+    fn physical_for_with_layer(&self, path: &str) -> Option<(PathBuf, usize)> {
         // Upper-layer whiteout: lower entries are masked.
         if let Some((parent, name)) = split_parent_name(path) {
             let mut wh = self.layers[0].clone();
@@ -166,13 +186,18 @@ impl RspacefsFuse {
                 return None;
             }
         }
-        for layer in &self.layers {
+        for (idx, layer) in self.layers.iter().enumerate() {
             let p = layer.join(path);
             if p.symlink_metadata().is_ok() {
-                return Some(p);
+                return Some((p, idx));
             }
         }
         None
+    }
+
+    /// Convenience wrapper for callers that only need the physical path.
+    fn physical_for(&self, path: &str) -> Option<PathBuf> {
+        self.physical_for_with_layer(path).map(|(p, _)| p)
     }
 
     /// Build a FileAttr from the physical file backing this overlay path. If
@@ -312,6 +337,29 @@ impl RspacefsFuse {
 // borrow-checker noise out of each Filesystem method.
 
 impl Filesystem for RspacefsFuse {
+    // ── Init handshake ──────────────────────────────────────────────────────
+
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        // Advertise passthrough capability to the kernel. If the running
+        // kernel is < 6.9 (no passthrough support) this returns Err; we
+        // ignore it and continue with daemon-mediated reads.
+        if let Err(unsupported) = config.add_capabilities(consts::FUSE_PASSTHROUGH) {
+            tracing::info!(
+                "kernel does not support FUSE_PASSTHROUGH ({:?}); reads will route through the daemon",
+                unsupported
+            );
+        } else {
+            tracing::info!(
+                "FUSE_PASSTHROUGH enabled — read-only opens of non-verified files bypass the daemon"
+            );
+        }
+        Ok(())
+    }
+
     // ── Lookup / metadata ────────────────────────────────────────────────────
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -524,21 +572,21 @@ impl Filesystem for RspacefsFuse {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
         };
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        if !p.exists().unwrap_or(false) {
-            return reply.error(ENOENT);
-        }
 
         let accmode = flags & libc::O_ACCMODE;
         let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
-
         let fh = self.alloc_fh();
 
         if writable {
-            // Read into buffer; partial writes need read-modify-write.
+            // Writable: buffer-then-flush. Open via the vfs root so write-
+            // back goes through LayerFS (which does its own copy-up).
+            let p = match self.root.join(&path) {
+                Ok(v) => v,
+                Err(_) => return reply.error(EIO),
+            };
+            if !p.exists().unwrap_or(false) {
+                return reply.error(ENOENT);
+            }
             let mut data = Vec::new();
             if (flags & libc::O_TRUNC) == 0 {
                 if let Ok(mut f) = p.open_file() {
@@ -556,20 +604,55 @@ impl Filesystem for RspacefsFuse {
                     writable: true,
                 },
             );
-        } else {
-            // Read-only: stream from a SeekAndRead handle. No whole-file
-            // copy in memory. (For verified lowers, the SeekAndRead is
-            // already a Cursor over the verified bytes — still in memory
-            // there, but at least it's not duplicated by us.)
-            match p.open_file() {
-                Ok(reader) => {
-                    self.open_files.insert(fh, OpenFile::Streaming { reader });
+            return reply.opened(fh, 0);
+        }
+
+        // Read-only: try passthrough first. Passthrough hands the kernel a
+        // direct fd to the backing file so subsequent reads NEVER hit our
+        // daemon. Only valid when the resolved physical file lives in a
+        // non-verified layer; verity-protected layers must stay on the
+        // daemon path so block hashes are checked.
+        if let Some((phys, layer_idx)) = self.physical_for_with_layer(&path) {
+            let verified = *self.verified_layers.get(layer_idx).unwrap_or(&false);
+            if !verified {
+                if let Ok(backing_file) = std::fs::File::open(&phys) {
+                    match reply.open_backing(&backing_file) {
+                        Ok(backing) => {
+                            // opened_passthrough consumes the reply but takes
+                            // &BackingId, so we keep ownership.
+                            reply.opened_passthrough(fh, 0, &backing);
+                            self.open_files
+                                .insert(fh, OpenFile::Passthrough { _backing: backing });
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "passthrough open failed for {} ({}); falling back to daemon read",
+                                path,
+                                e
+                            );
+                        }
+                    }
                 }
-                Err(_) => return reply.error(EIO),
             }
         }
 
-        reply.opened(fh, 0);
+        // Fallback / verity path: stream from a SeekAndRead via the overlay
+        // (VerifiedFS hashes each block when applicable).
+        let p = match self.root.join(&path) {
+            Ok(v) => v,
+            Err(_) => return reply.error(EIO),
+        };
+        if !p.exists().unwrap_or(false) {
+            return reply.error(ENOENT);
+        }
+        match p.open_file() {
+            Ok(reader) => {
+                self.open_files.insert(fh, OpenFile::Streaming { reader });
+                reply.opened(fh, 0);
+            }
+            Err(_) => reply.error(EIO),
+        }
     }
 
     fn read(
@@ -587,6 +670,9 @@ impl Filesystem for RspacefsFuse {
             return reply.error(EBADF);
         };
         match file {
+            // Kernel should be serving these directly via passthrough; if we
+            // see a read on a passthrough handle something has slipped.
+            OpenFile::Passthrough { .. } => reply.error(EIO),
             OpenFile::Streaming { reader } => {
                 if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
                     return reply.error(EIO);
@@ -627,6 +713,7 @@ impl Filesystem for RspacefsFuse {
             return reply.error(EBADF);
         };
         match file {
+            OpenFile::Passthrough { .. } => reply.error(libc::EACCES),
             OpenFile::Streaming { .. } => reply.error(libc::EACCES),
             OpenFile::Buffered { data: buf, dirty, writable, .. } => {
                 if !*writable {
@@ -658,6 +745,8 @@ impl Filesystem for RspacefsFuse {
             return reply.error(EBADF);
         };
         match file {
+            // Drop on BackingId fires BACKING_CLOSE in the kernel.
+            OpenFile::Passthrough { .. } => reply.ok(),
             OpenFile::Streaming { .. } => reply.ok(),
             OpenFile::Buffered { path, data, dirty, .. } => {
                 if dirty {
@@ -1006,6 +1095,7 @@ impl Filesystem for RspacefsFuse {
             return reply.error(EBADF);
         };
         match file {
+            OpenFile::Passthrough { .. } => reply.ok(),
             OpenFile::Streaming { .. } => reply.ok(),
             OpenFile::Buffered { path, data, dirty, .. } => {
                 if !*dirty {

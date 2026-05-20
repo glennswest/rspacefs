@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 2026-05-19 (FUSE passthrough)
+- **feat (fuse):** **FUSE passthrough** for read-only opens of non-verified files. Upgraded `fuser` 0.15 → 0.16 with the `abi-7-40` feature (passthrough landed in 0.16, Sep 2025 — saved us a fork). On a kernel ≥ 6.9, `rspacefs-mount` now calls `FUSE_DEV_IOC_BACKING_OPEN` to register the backing fd, then replies with `opened_passthrough(...)`. Subsequent kernel reads bypass our daemon entirely and read direct from the underlying disk. **The daemon is no longer in the hot path for non-verified files.** Tracked layer-by-layer: verity-protected layers (`--lower-verified-pinned`, `--lower-verified`) stay on the daemon path so block hashes are checked; plain `--lower` layers use passthrough. Gracefully falls back to streaming on older kernels (logged at `init`). New `OpenFile::Passthrough { BackingId }` variant holds the kernel-managed backing alive until `release`, where its Drop fires `BACKING_CLOSE`.
+
 ### 2026-05-19 (more)
 - **feat (verity):** Streaming reads through `VerifiedFS`. New `VerifiedReader` keeps one 4 KB block in memory at a time, verifies each block exactly once when first accessed (or every time when caching is disabled in pinned mode), and serves arbitrary `Read`/`Seek` operations. Old behavior read the whole file into a `Cursor` at open time — fine for `/etc/*` config, catastrophic for `/usr/lib/*.so` and large binaries. Now a 200 MB shared library opens in O(1) memory.
 - **feat (fuse):** `fsync` and `flush` FUSE ops. `fsync` forces a buffered-handle write-back to upper before returning OK; `flush` is a no-op (release does the write-back to coalesce). Streaming handles have nothing to sync and return OK directly. Container processes calling `fsync(2)` no longer get `ENOSYS`.
