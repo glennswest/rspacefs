@@ -54,6 +54,230 @@ mod linux_main {
     // Silence the unused-import warning when anyhow!() isn't used elsewhere.
     const _: fn() -> anyhow::Error = || anyhow!("unused");
 
+    // ── containers-storage `mount_program` compatibility ────────────────────
+    //
+    // When containers-storage (used by podman, buildah, CRI-O) calls a
+    // user-defined `mount_program`, the argv looks like:
+    //
+    //     mount_program [-o lowerdir=L1:L2,upperdir=U,workdir=W,opt1,opt2,...] /mnt/point
+    //
+    // This is the same contract `fuse-overlayfs` follows. Detecting it
+    // distinguishes the storage.conf invocation from a direct user run.
+
+    /// True if `argv` looks like a `mount_program` invocation. Heuristic: any
+    /// of the recognised overlay options as a `-o ...` flag.
+    pub fn looks_like_mount_program(argv: &[std::ffi::OsString]) -> bool {
+        let mut iter = argv.iter().map(|s| s.to_string_lossy());
+        let _ = iter.next();
+        let mut prev_was_o = false;
+        for arg in iter {
+            if arg == "-o" || arg == "--options" {
+                prev_was_o = true;
+                continue;
+            }
+            if prev_was_o {
+                return arg.contains("lowerdir=") || arg.contains("upperdir=");
+            }
+            // Inline form: `-olowerdir=...`
+            if arg.starts_with("-o") && (arg.contains("lowerdir=") || arg.contains("upperdir=")) {
+                return true;
+            }
+            prev_was_o = false;
+        }
+        false
+    }
+
+    /// Parse the overlay-style argv and dispatch into the mount.
+    ///
+    /// `RSPACEFS_VERITY_LOWERS` (optional env var) is a JSON map of
+    /// `{ "/path/to/lower": { "manifest": "...", "tree": "..." } }`. Any
+    /// lower listed here gets verity-pinned mode; lowers not listed are
+    /// plain (passthrough-eligible).
+    pub fn run_mount_program(argv: &[std::ffi::OsString]) -> Result<()> {
+        init_tracing(false);
+
+        let mut iter = argv.iter().peekable();
+        let _ = iter.next(); // skip program name
+
+        let mut upper: Option<PathBuf> = None;
+        let mut lowers: Vec<PathBuf> = Vec::new();
+        let mut mountpoint: Option<PathBuf> = None;
+        let mut allow_other = false;
+        let mut allow_root = false;
+
+        while let Some(arg) = iter.next() {
+            let s = arg.to_string_lossy().into_owned();
+            if s == "-o" || s == "--options" {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("expected value after -o"))?;
+                parse_overlay_options(
+                    &val.to_string_lossy(),
+                    &mut upper,
+                    &mut lowers,
+                    &mut allow_other,
+                    &mut allow_root,
+                )?;
+            } else if let Some(rest) = s.strip_prefix("-o") {
+                parse_overlay_options(rest, &mut upper, &mut lowers, &mut allow_other, &mut allow_root)?;
+            } else if s == "-f" || s == "-d" || s == "-s" {
+                // foreground / debug / single-threaded — accept and ignore;
+                // we already run foreground & single-threaded enough for our
+                // purposes.
+            } else if s == "--help" || s == "-h" {
+                print_mount_program_help();
+                return Ok(());
+            } else if s.starts_with('-') {
+                tracing::warn!(option = %s, "ignoring unrecognised mount_program option");
+            } else {
+                if mountpoint.is_some() {
+                    bail!("unexpected positional argument {:?}", s);
+                }
+                mountpoint = Some(PathBuf::from(&s));
+            }
+        }
+
+        let mountpoint = mountpoint.ok_or_else(|| anyhow!("no mountpoint argument"))?;
+        let upper = upper.ok_or_else(|| anyhow!("missing upperdir= in -o"))?;
+        if lowers.is_empty() {
+            bail!("no lowerdir= specified (or all empty)");
+        }
+
+        // Optional verity hints via env var.
+        let verity_hints: std::collections::HashMap<PathBuf, (PathBuf, PathBuf)> =
+            std::env::var("RSPACEFS_VERITY_LOWERS")
+                .ok()
+                .and_then(|s| parse_verity_hints_env(&s).ok())
+                .unwrap_or_default();
+
+        // Build vfs layer set + parallel physical_layers + verified_layers.
+        let upper_vfs = VfsPath::new(PhysicalFS::new(upper.clone()));
+        let mut lower_vfs: Vec<VfsPath> = Vec::new();
+        let mut physical_layers: Vec<PathBuf> = vec![upper.clone()];
+        let mut verified_layers: Vec<bool> = vec![false];
+
+        for l in &lowers {
+            if let Some((mfs, tree)) = verity_hints.get(l) {
+                let path = VfsPath::new(PhysicalFS::new(l.clone()));
+                let verified = VerifiedFS::load_pinned(path, mfs, tree, OnFailure::Reject)
+                    .context(format!("loading pinned verity for {}", l.display()))?;
+                lower_vfs.push(verified.into());
+                physical_layers.push(l.clone());
+                verified_layers.push(true);
+            } else {
+                lower_vfs.push(VfsPath::new(PhysicalFS::new(l.clone())));
+                physical_layers.push(l.clone());
+                verified_layers.push(false);
+            }
+        }
+
+        tracing::info!(
+            mountpoint = %mountpoint.display(),
+            upper = %upper.display(),
+            lowers = lowers.len(),
+            verified_lowers = verity_hints.len(),
+            "starting rspacefs FUSE mount (mount_program mode)"
+        );
+
+        let overlay = LayerFS::new(upper_vfs, lower_vfs);
+        let fs = crate::fs::RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
+
+        let mut opts: Vec<MountOption> = vec![
+            MountOption::FSName("rspacefs".to_string()),
+            MountOption::Subtype("rspacefs".to_string()),
+            MountOption::DefaultPermissions,
+        ];
+        if allow_other {
+            opts.push(MountOption::AllowOther);
+        }
+        if allow_root {
+            opts.push(MountOption::AllowRoot);
+        }
+
+        fuser::mount2(fs, &mountpoint, &opts)
+            .context("FUSE mount failed (need /dev/fuse access?)")?;
+        Ok(())
+    }
+
+    fn parse_overlay_options(
+        opts: &str,
+        upper: &mut Option<PathBuf>,
+        lowers: &mut Vec<PathBuf>,
+        allow_other: &mut bool,
+        allow_root: &mut bool,
+    ) -> Result<()> {
+        for tok in opts.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Some(v) = tok.strip_prefix("lowerdir=") {
+                for d in v.split(':') {
+                    if !d.is_empty() {
+                        lowers.push(PathBuf::from(d));
+                    }
+                }
+            } else if let Some(v) = tok.strip_prefix("upperdir=") {
+                *upper = Some(PathBuf::from(v));
+            } else if tok.starts_with("workdir=") {
+                // overlay's workdir is for staging temp content; we don't
+                // need it — our copy-up is direct into upperdir.
+            } else if tok == "allow_other" {
+                *allow_other = true;
+            } else if tok == "allow_root" {
+                *allow_root = true;
+            } else if tok == "volatile" {
+                // No-op for now. (overlay 'volatile' = skip fsync; we don't
+                // currently exploit it but accept silently.)
+            } else if tok == "nodev" || tok == "noexec" || tok == "nosuid" || tok == "ro" || tok == "rw" {
+                // VFS / kernel mount flags — set by the runtime, applied by
+                // FUSE itself or `mount(8)`. Accept silently.
+            } else if tok.starts_with("metacopy=")
+                || tok.starts_with("redirect_dir=")
+                || tok.starts_with("index=")
+            {
+                // overlayfs-specific tunables; not meaningful for us.
+            } else {
+                tracing::debug!(opt = %tok, "ignoring overlay option");
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_verity_hints_env(
+        s: &str,
+    ) -> Result<std::collections::HashMap<PathBuf, (PathBuf, PathBuf)>> {
+        // JSON of { "/path": { "manifest": "...", "tree": "..." }, ... }
+        #[derive(serde::Deserialize)]
+        struct V {
+            manifest: PathBuf,
+            tree: PathBuf,
+        }
+        let parsed: std::collections::HashMap<String, V> = serde_json::from_str(s)
+            .context("RSPACEFS_VERITY_LOWERS env var must be JSON")?;
+        Ok(parsed
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), (v.manifest, v.tree)))
+            .collect())
+    }
+
+    fn print_mount_program_help() {
+        println!(
+            "rspacefs-mount (containers-storage `mount_program` compatible mode)\n\
+             \n\
+             Usage:\n\
+               rspacefs-mount [-f] [-o lowerdir=L1:L2,upperdir=U,workdir=W,opt,...] MOUNTPOINT\n\
+             \n\
+             Environment:\n\
+               RSPACEFS_VERITY_LOWERS  JSON map of {{\"/lower/path\": {{\"manifest\": \"...\",\
+             \"tree\": \"...\"}}}}; listed lowers are mounted in verity-pinned mode.\n\
+             \n\
+             Direct invocation (non-mount_program mode):\n\
+               rspacefs-mount --upper DIR --lower DIR... [--lower-verified-pinned DIR=MFS=TREE] MOUNTPOINT\n\
+            "
+        );
+    }
+
     #[derive(Parser)]
     #[command(
         name = "rspacefs-mount",
@@ -242,6 +466,16 @@ mod linux_main {
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    // Dispatch on argv shape:
+    // 1. If invoked with overlay-style `[-o lowerdir=...,upperdir=...,workdir=...] /mountpoint`,
+    //    parse those options — this is the containers-storage `mount_program`
+    //    contract used by podman / buildah / CRI-O on OpenShift etc.
+    // 2. Otherwise fall through to the native clap parser
+    //    (--upper / --lower / --lower-verified-pinned / mountpoint).
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if linux_main::looks_like_mount_program(&raw) {
+        return linux_main::run_mount_program(&raw);
+    }
     linux_main::run()
 }
 

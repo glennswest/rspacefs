@@ -384,6 +384,8 @@ dependencies = [
  "libc",
  "rspacefs-core",
  "rspacefs-verity",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "vfs",
