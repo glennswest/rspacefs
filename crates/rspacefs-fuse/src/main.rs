@@ -459,7 +459,7 @@ mod linux_main {
             opts.push(MountOption::AutoUnmount);
         }
 
-        // Branch: with control socket → spawn_mount2 + control thread + join.
+        // Branch: with control socket → Session::new + notifier() + se.run().
         // Without → mount2 (blocks until unmount; current behaviour).
         match &cli.control_socket {
             Some(sock_path) => {
@@ -471,7 +471,11 @@ mod linux_main {
                     mount_time: std::time::SystemTime::now(),
                     root: layered_root,
                 });
-                let session = fuser::spawn_mount2(fs, &cli.mountpoint, &opts)
+                // Session::new gives us the same blocking se.run() as
+                // mount2() but lets us pull notifier() out first for the
+                // control thread. (BackgroundSession::join unmounts on
+                // call, which is the opposite of what we want.)
+                let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
                     .context("FUSE mount failed (need /dev/fuse access?)")?;
                 let notifier = session.notifier();
                 let _ctl = crate::control::spawn_control_thread(
@@ -480,10 +484,9 @@ mod linux_main {
                     notifier,
                 )
                 .context("failed to start control socket")?;
-                // Block until the FUSE session ends (unmount).
-                session.join();
-                // Clean up the stale socket file on exit.
+                let res = session.run();
                 let _ = std::fs::remove_file(sock_path);
+                res.context("FUSE session ended with error")?;
             }
             None => {
                 fuser::mount2(fs, &cli.mountpoint, &opts)
