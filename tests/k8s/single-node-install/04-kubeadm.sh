@@ -23,7 +23,13 @@ exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
 log "installing kubelet kubeadm kubectl"
-dnf -y install --disableexcludes=kubernetes kubelet kubeadm kubectl >/dev/null
+# dnf5 uses --disable-excludes (dashed); dnf4 uses --disableexcludes (no dash).
+if dnf --version 2>&1 | head -1 | grep -qE '^5\.'; then
+  DNF_EXCLUDE_FLAG="--disable-excludes=kubernetes"
+else
+  DNF_EXCLUDE_FLAG="--disableexcludes=kubernetes"
+fi
+dnf -y install $DNF_EXCLUDE_FLAG kubelet kubeadm kubectl >/dev/null
 
 # Pin kubelet cgroup driver to systemd to match CRI-O.
 log "configuring kubelet cgroup driver = systemd"
