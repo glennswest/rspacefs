@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# 02-crio.sh — install CRI-O, wire rspacefs as containers-storage mount_program.
-# Idempotent.
+# 03-crio.sh — install CRI-O, wire rspacefs as containers-storage mount_program.
+# Idempotent. Must run AFTER 02-rspacefs.sh: storage.conf references
+# /usr/local/bin/rspacefs-mount and crio refuses to start without it.
 
 source "$(dirname "$0")/00-vars.sh"
 
-if is_done 02-crio; then
+if is_done 03-crio; then
   log "crio already done, skipping"
   exit 0
 fi
@@ -65,5 +66,5 @@ if ! systemctl is-active --quiet crio; then
 fi
 log "crio is active: $(crictl --runtime-endpoint unix:///var/run/crio/crio.sock version 2>/dev/null | head -1)"
 
-mark_done 02-crio
+mark_done 03-crio
 log "crio done"

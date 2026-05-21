@@ -19,8 +19,8 @@ logic can be patched into a Single-Node OpenShift (SNO) installer later.
 |---|---|
 | `00-vars.sh`           | Versions, paths, environment. Source from every other script. |
 | `01-prereqs.sh`        | Swap off, kernel modules, sysctls, firewall, SELinux. |
-| `02-crio.sh`           | Install CRI-O, configure storage.conf with rspacefs mount_program. |
-| `03-rspacefs.sh`       | Install rspacefs-mount + rspacefs-ctl binaries to /usr/local/bin. |
+| `02-rspacefs.sh`       | Install rspacefs-mount + rspacefs CLI to /usr/local/bin (must precede crio start). |
+| `03-crio.sh`           | Install CRI-O, configure storage.conf with rspacefs mount_program. |
 | `04-kubeadm.sh`        | Install kubelet/kubeadm/kubectl, `kubeadm init`, untaint control-plane. |
 | `05-cni.sh`            | Install Cilium via the Cilium CLI. |
 | `06-validate.sh`       | Smoke tests — all system pods Ready, simple workload runs. |

@@ -20,7 +20,9 @@ export SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/16}"
 # rspacefs install paths on the target.
 export RSPACEFS_BIN_DIR="${RSPACEFS_BIN_DIR:-/usr/local/bin}"
 export RSPACEFS_MOUNT_BIN="${RSPACEFS_BIN_DIR}/rspacefs-mount"
-export RSPACEFS_CTL_BIN="${RSPACEFS_BIN_DIR}/rspacefs-ctl"
+# rspacefs-cli is built with bin name `rspacefs`; we keep that name on
+# disk so `rspacefs ctl --socket <path> ping` matches the docs.
+export RSPACEFS_CLI_BIN="${RSPACEFS_BIN_DIR}/rspacefs"
 
 # CRI-O storage root. CRI-O default is /var/lib/containers/storage. We
 # keep that — the mount_program runs underneath transparently.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-bin.sh — cross-compile rspacefs-mount and rspacefs-ctl for the install target.
+# build-bin.sh — cross-compile rspacefs-mount and rspacefs for the install target.
 # Run from the rspacefs repo root.
 
 set -euo pipefail
@@ -9,7 +9,7 @@ TARGET="${ARCH}-unknown-linux-gnu"
 
 cd "$(dirname "$0")/../../.."  # repo root
 
-echo "==> building rspacefs-mount, rspacefs-ctl for ${TARGET}"
+echo "==> building rspacefs-mount, rspacefs for ${TARGET}"
 if ! rustup target list --installed | grep -q "^${TARGET}$"; then
   echo "==> adding rust target ${TARGET}"
   rustup target add "${TARGET}"
@@ -22,13 +22,13 @@ cargo build --release --target "${TARGET}" \
 
 OUT="target/${TARGET}/release"
 echo "==> built:"
-ls -la "${OUT}/rspacefs-mount" "${OUT}/rspacefs-ctl"
+ls -la "${OUT}/rspacefs-mount" "${OUT}/rspacefs"
 
 DEST="tests/k8s/single-node-install"
 cp -f "${OUT}/rspacefs-mount" "${DEST}/rspacefs-mount"
-cp -f "${OUT}/rspacefs-ctl"   "${DEST}/rspacefs-ctl"
+cp -f "${OUT}/rspacefs"       "${DEST}/rspacefs"
 echo "==> staged for scp:"
-ls -la "${DEST}/rspacefs-mount" "${DEST}/rspacefs-ctl"
+ls -la "${DEST}/rspacefs-mount" "${DEST}/rspacefs"
 
 cat <<EOF
 

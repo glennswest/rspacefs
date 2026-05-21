@@ -47,6 +47,6 @@ else
 fi
 
 log "removing rspacefs binaries"
-rm -f "$RSPACEFS_MOUNT_BIN" "$RSPACEFS_CTL_BIN"
+rm -f "$RSPACEFS_MOUNT_BIN" "$RSPACEFS_CLI_BIN"
 
 log "uninstall complete — host is clean"

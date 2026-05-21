@@ -12,8 +12,10 @@ log "K8S_MINOR=${K8S_MINOR}  CRIO_VERSION=${CRIO_VERSION}  CILIUM_CLI_VERSION=${
 log "RSPACEFS_INSTALL_DIR=${RSPACEFS_INSTALL_DIR}"
 
 bash "${HERE}/01-prereqs.sh"
-bash "${HERE}/02-crio.sh"
-bash "${HERE}/03-rspacefs.sh"
+# rspacefs binaries must exist before crio.service starts (storage.conf
+# references mount_program; crio refuses to come up without it).
+bash "${HERE}/02-rspacefs.sh"
+bash "${HERE}/03-crio.sh"
 bash "${HERE}/04-kubeadm.sh"
 bash "${HERE}/05-cni.sh"
 bash "${HERE}/06-validate.sh"
