@@ -54,6 +54,16 @@ storage_option = [
 pause_image = "registry.k8s.io/pause:3.10"
 EOF
 
+log "disabling crio.service systemd watchdog (otherwise it dies in 60s while CNI is unconfigured during kubeadm bootstrap)"
+install -d /etc/systemd/system/crio.service.d
+cat >/etc/systemd/system/crio.service.d/10-no-watchdog.conf <<'EOF'
+# CRI-O reports unhealthy to systemd while CNI is unconfigured (NetworkPluginNotReady).
+# During kubeadm bootstrap that's the whole gap between 'kubeadm init' and the CNI install.
+# Stock crio.service has WatchdogSec=60s which kills crio mid-bootstrap. Override to 0 here.
+[Service]
+WatchdogSec=0
+EOF
+
 log "enabling crio.service"
 systemctl daemon-reload
 systemctl enable --now crio

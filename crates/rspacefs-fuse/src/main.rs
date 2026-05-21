@@ -196,9 +196,94 @@ mod linux_main {
             opts.push(MountOption::AllowRoot);
         }
 
+        // containers-storage expects mount_program to RETURN once the mount
+        // is established. fuser::mount2() blocks until unmount, so we fork:
+        // the parent polls the mountpoint and exits 0 when the FUSE mount
+        // shows up; the child detaches and runs the FUSE event loop forever.
+        daemonize_after_mount(&mountpoint).context("daemonize")?;
+
         fuser::mount2(fs, &mountpoint, &opts)
             .context("FUSE mount failed (need /dev/fuse access?)")?;
         Ok(())
+    }
+
+    /// Fork the process. The parent polls the mountpoint until it sees a
+    /// FUSE superblock and exits 0, or exits non-zero if the child dies or
+    /// the timeout fires. The child detaches (setsid, stdio→/dev/null) and
+    /// returns so the caller can drop into the FUSE event loop.
+    ///
+    /// This is the daemonization contract containers-storage `mount_program`
+    /// expects: the binary returns as soon as the kernel acknowledges the
+    /// mount; the FUSE server lives on as a detached process.
+    fn daemonize_after_mount(mountpoint: &std::path::Path) -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        // Forking with live threads is undefined behaviour. We must fork
+        // before fuser spawns any worker threads — which is fine: at this
+        // point we've only built clap output, the FUSE session is created
+        // by mount2() *after* this returns.
+
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                bail!("fork failed: {}", std::io::Error::last_os_error());
+            }
+            if pid > 0 {
+                // Parent — poll mountpoint, wait for FUSE_SUPER_MAGIC.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if is_fuse_mounted(mountpoint) {
+                        // Mount is live — let the child carry on.
+                        libc::_exit(0);
+                    }
+                    // Has the child died?
+                    let mut status: libc::c_int = 0;
+                    let wpid = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    if wpid == pid {
+                        if libc::WIFEXITED(status) {
+                            libc::_exit(libc::WEXITSTATUS(status));
+                        }
+                        libc::_exit(1);
+                    }
+                    if Instant::now() >= deadline {
+                        // Give up — kill the child so it doesn't hang.
+                        libc::kill(pid, libc::SIGTERM);
+                        libc::_exit(1);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            // Child — detach.
+            if libc::setsid() < 0 {
+                bail!("setsid: {}", std::io::Error::last_os_error());
+            }
+            let dev_null = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDWR);
+            if dev_null >= 0 {
+                libc::dup2(dev_null, libc::STDIN_FILENO);
+                libc::dup2(dev_null, libc::STDOUT_FILENO);
+                libc::dup2(dev_null, libc::STDERR_FILENO);
+                if dev_null > libc::STDERR_FILENO {
+                    libc::close(dev_null);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True if the path's filesystem reports the FUSE magic. Used by the
+    /// daemonize parent to confirm the mount is up before exiting.
+    fn is_fuse_mounted(p: &std::path::Path) -> bool {
+        const FUSE_SUPER_MAGIC: libc::c_long = 0x65735546;
+        let c = match std::ffi::CString::new(p.to_string_lossy().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
+            return false;
+        }
+        i64::from(buf.f_type) == FUSE_SUPER_MAGIC as i64
     }
 
     fn parse_overlay_options(
