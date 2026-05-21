@@ -38,6 +38,18 @@ EOF
 
 systemctl enable kubelet
 
+# 03-crio's marker might be set from a prior run that left crio stopped.
+# Ensure the runtime is up before kubeadm tries to talk to it.
+log "ensuring crio.service is active"
+systemctl start crio
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [ -S /var/run/crio/crio.sock ] && systemctl is-active --quiet crio; then
+    break
+  fi
+  sleep 1
+done
+[ -S /var/run/crio/crio.sock ] || die "crio socket not present after 10s — check 'systemctl status crio'"
+
 log "running kubeadm init (this can take ~60s while it pulls control-plane images)"
 # --pod-network-cidr matches what we'll tell Cilium.
 kubeadm init \
