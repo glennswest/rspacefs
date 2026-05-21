@@ -41,6 +41,8 @@ use fuser::{
 use libc::{EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY};
 use vfs::{VfsFileType, VfsPath};
 
+use crate::stats::{Op, Stats};
+
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
 const FALLBACK_FILE_MODE: u16 = 0o644;
@@ -91,6 +93,9 @@ pub struct RspacefsFuse {
     fallback_gid: u32,
     /// Single timestamp stamped into fallback attrs.
     mount_time: SystemTime,
+    /// Shared operational counters. Cloned into the control thread so
+    /// `stats` / `metrics-text` requests don't need to lock the FS.
+    pub(crate) stats: Arc<Stats>,
 }
 
 /// Per-open-file state. Two flavors:
@@ -135,6 +140,19 @@ impl RspacefsFuse {
     /// for an accurate FileAttr (mode bits, uid/gid, times, nlink) — the
     /// `vfs` crate's metadata trait throws all of that away.
     pub fn new(root: VfsPath, layers: Vec<PathBuf>, verified_layers: Vec<bool>) -> Self {
+        Self::new_with_stats(root, layers, verified_layers, Arc::new(Stats::new()))
+    }
+
+    /// Like `new`, but lets the caller hand in a pre-built `Stats` so the
+    /// control thread can share it. The control surface needs an
+    /// `Arc<Stats>` to read counters without locking the FS — easiest path
+    /// is to build it once at startup and clone into both places.
+    pub fn new_with_stats(
+        root: VfsPath,
+        layers: Vec<PathBuf>,
+        verified_layers: Vec<bool>,
+        stats: Arc<Stats>,
+    ) -> Self {
         debug_assert_eq!(layers.len(), verified_layers.len());
         let mut inodes = HashMap::new();
         let mut paths = HashMap::new();
@@ -153,7 +171,15 @@ impl RspacefsFuse {
             fallback_uid: unsafe { libc::getuid() },
             fallback_gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
+            stats,
         }
+    }
+
+    /// Public accessor for callers (the control thread) that need a
+    /// reference to the shared `Stats` after the FS has been moved into
+    /// the FUSE session.
+    pub fn stats(&self) -> Arc<Stats> {
+        Arc::clone(&self.stats)
     }
 
     fn intern_path(&mut self, path: String) -> u64 {
@@ -387,6 +413,7 @@ impl Filesystem for RspacefsFuse {
     // ── Lookup / metadata ────────────────────────────────────────────────────
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        self.stats.record(Op::Lookup, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -414,6 +441,7 @@ impl Filesystem for RspacefsFuse {
         _fh: Option<u64>,
         reply: ReplyAttr,
     ) {
+        self.stats.record(Op::Getattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -442,6 +470,7 @@ impl Filesystem for RspacefsFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        self.stats.record(Op::Setattr, ino, 0, 0);
         // We support the only setattr op containers actually rely on:
         // `truncate(path, 0)` to clobber a file. Everything else returns the
         // current attrs unchanged (kernel still sees a successful chmod, etc.)
@@ -474,6 +503,7 @@ impl Filesystem for RspacefsFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        self.stats.record(Op::Readdir, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -539,6 +569,7 @@ impl Filesystem for RspacefsFuse {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        self.stats.record(Op::Mkdir, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -562,6 +593,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.stats.record(Op::Rmdir, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -592,6 +624,7 @@ impl Filesystem for RspacefsFuse {
     // ── Files ────────────────────────────────────────────────────────────────
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        self.stats.record(Op::Open, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -619,6 +652,8 @@ impl Filesystem for RspacefsFuse {
                     }
                 }
             }
+            self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
+            self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
             self.open_files.insert(
                 fh,
                 OpenFile::Buffered {
@@ -650,18 +685,24 @@ impl Filesystem for RspacefsFuse {
                 let existing = cache.get(&ino).and_then(|w| w.upgrade());
                 if let Some(backing) = existing {
                     drop(cache);
+                    self.stats.backing_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
+                    self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                     reply.opened_passthrough(fh, 0, &backing);
                     self.open_files
                         .insert(fh, OpenFile::Passthrough { _backing: backing });
                     return;
                 }
                 // Cache miss — try to open + register a fresh backing.
+                self.stats.backing_cache_misses.fetch_add(1, Ordering::Relaxed);
                 if let Ok(backing_file) = std::fs::File::open(&phys) {
                     match reply.open_backing(&backing_file) {
                         Ok(backing) => {
                             let backing = Arc::new(backing);
                             cache.insert(ino, Arc::downgrade(&backing));
                             drop(cache);
+                            self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
+                            self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                             reply.opened_passthrough(fh, 0, &backing);
                             self.open_files
                                 .insert(fh, OpenFile::Passthrough { _backing: backing });
@@ -691,6 +732,8 @@ impl Filesystem for RspacefsFuse {
         }
         match p.open_file() {
             Ok(reader) => {
+                self.stats.streaming_opens.fetch_add(1, Ordering::Relaxed);
+                self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                 self.open_files.insert(fh, OpenFile::Streaming { reader });
                 reply.opened(fh, 0);
             }
@@ -701,7 +744,7 @@ impl Filesystem for RspacefsFuse {
     fn read(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -710,31 +753,42 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyData,
     ) {
         let Some(file) = self.open_files.get_mut(&fh) else {
+            self.stats.record(Op::Read, ino, 0, EBADF);
             return reply.error(EBADF);
         };
         match file {
             // Kernel should be serving these directly via passthrough; if we
             // see a read on a passthrough handle something has slipped.
-            OpenFile::Passthrough { .. } => reply.error(EIO),
+            OpenFile::Passthrough { .. } => {
+                self.stats.record(Op::Read, ino, 0, EIO);
+                reply.error(EIO)
+            }
             OpenFile::Streaming { reader } => {
                 if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
+                    self.stats.record(Op::Read, ino, 0, EIO);
                     return reply.error(EIO);
                 }
                 let mut buf = vec![0u8; size as usize];
                 match reader.read(&mut buf) {
                     Ok(n) => {
                         buf.truncate(n);
+                        self.stats.record(Op::Read, ino, n as u64, 0);
                         reply.data(&buf);
                     }
-                    Err(_) => reply.error(EIO),
+                    Err(_) => {
+                        self.stats.record(Op::Read, ino, 0, EIO);
+                        reply.error(EIO)
+                    }
                 }
             }
             OpenFile::Buffered { data, .. } => {
                 let start = offset as usize;
                 if start >= data.len() {
+                    self.stats.record(Op::Read, ino, 0, 0);
                     return reply.data(&[]);
                 }
                 let end = (start + size as usize).min(data.len());
+                self.stats.record(Op::Read, ino, (end - start) as u64, 0);
                 reply.data(&data[start..end]);
             }
         }
@@ -743,7 +797,7 @@ impl Filesystem for RspacefsFuse {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -753,13 +807,17 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyWrite,
     ) {
         let Some(file) = self.open_files.get_mut(&fh) else {
+            self.stats.record(Op::Write, ino, 0, EBADF);
             return reply.error(EBADF);
         };
         match file {
-            OpenFile::Passthrough { .. } => reply.error(libc::EACCES),
-            OpenFile::Streaming { .. } => reply.error(libc::EACCES),
+            OpenFile::Passthrough { .. } | OpenFile::Streaming { .. } => {
+                self.stats.record(Op::Write, ino, 0, libc::EACCES);
+                reply.error(libc::EACCES)
+            }
             OpenFile::Buffered { data: buf, dirty, writable, .. } => {
                 if !*writable {
+                    self.stats.record(Op::Write, ino, 0, libc::EACCES);
                     return reply.error(libc::EACCES);
                 }
                 let off = offset as usize;
@@ -769,6 +827,7 @@ impl Filesystem for RspacefsFuse {
                 }
                 buf[off..end].copy_from_slice(data);
                 *dirty = true;
+                self.stats.record(Op::Write, ino, data.len() as u64, 0);
                 reply.written(data.len() as u32);
             }
         }
@@ -777,13 +836,15 @@ impl Filesystem for RspacefsFuse {
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Release, ino, 0, 0);
+        self.stats.open_handles.fetch_sub(1, Ordering::Relaxed);
         let Some(file) = self.open_files.remove(&fh) else {
             return reply.error(EBADF);
         };
@@ -820,6 +881,7 @@ impl Filesystem for RspacefsFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        self.stats.record(Op::Create, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -851,6 +913,8 @@ impl Filesystem for RspacefsFuse {
         let ino = self.intern_path(path.clone());
         let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
         let fh = self.alloc_fh();
+        self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
+        self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
         self.open_files.insert(
             fh,
             OpenFile::Buffered {
@@ -864,6 +928,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.stats.record(Op::Unlink, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -897,6 +962,7 @@ impl Filesystem for RspacefsFuse {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Rename, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -949,6 +1015,7 @@ impl Filesystem for RspacefsFuse {
     // ── Symlinks ────────────────────────────────────────────────────────────
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        self.stats.record(Op::Readlink, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -971,6 +1038,7 @@ impl Filesystem for RspacefsFuse {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        self.stats.record(Op::Symlink, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -1017,6 +1085,7 @@ impl Filesystem for RspacefsFuse {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        self.stats.record(Op::Getxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -1047,6 +1116,7 @@ impl Filesystem for RspacefsFuse {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        self.stats.record(Op::Listxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -1085,6 +1155,7 @@ impl Filesystem for RspacefsFuse {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Setxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -1107,6 +1178,7 @@ impl Filesystem for RspacefsFuse {
         name: &OsStr,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Removexattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
@@ -1126,13 +1198,14 @@ impl Filesystem for RspacefsFuse {
     fn poll(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _ph: PollHandle,
         events: u32,
         _flags: u32,
         reply: ReplyPoll,
     ) {
+        self.stats.record(Op::Poll, ino, 0, 0);
         // Regular files and directories on a plain filesystem are *always*
         // poll-ready in the POSIX sense — read() / write() don't block on
         // them like they do on sockets / pipes / FIFOs. Echo back exactly
@@ -1150,11 +1223,12 @@ impl Filesystem for RspacefsFuse {
     fn fsync(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Fsync, ino, 0, 0);
         // For Buffered (writable) handles: flush in-memory dirty data to
         // the upper file now. Streaming (read-only) handles have nothing
         // to sync — return OK.
@@ -1188,11 +1262,12 @@ impl Filesystem for RspacefsFuse {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        self.stats.record(Op::Flush, ino, 0, 0);
         // Per POSIX: close() may flush; the kernel calls flush per close.
         // We do the actual write-back in release() to coalesce, so flush
         // is a no-op for our buffered model. Returning OK lets close()
@@ -1202,7 +1277,8 @@ impl Filesystem for RspacefsFuse {
 
     // ── Statfs ──────────────────────────────────────────────────────────────
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+        self.stats.record(Op::Statfs, ino, 0, 0);
         // Synthesised — we don't know the underlying disk's real numbers
         // without poking the upper layer's backing filesystem. Report large
         // dummy values so callers don't think they're out of space.

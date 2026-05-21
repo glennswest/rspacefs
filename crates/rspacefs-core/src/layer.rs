@@ -189,23 +189,32 @@ impl LayerFS {
         let mut current = path_parent.to_string();
         loop {
             let key = (lower_idx, current.clone());
-            // Read-lock fast path.
-            if let Some(&is_opq) = self.lower_opaque.read().unwrap().get(&key) {
-                if is_opq {
-                    return Ok(true);
+            // Read-lock fast path. CRITICAL: the read guard MUST be dropped
+            // before we try to take the write lock in the miss path — under
+            // Rust 2021 edition rules, an `if let Some(_) = guard.get(...)`
+            // pattern keeps the guard alive through the ENTIRE if/else
+            // block, so re-acquiring the lock as a writer would self-deadlock
+            // on this same single thread. Copy the value out and drop the
+            // guard explicitly via a let-binding, then branch.
+            let cached = self.lower_opaque.read().unwrap().get(&key).copied();
+            match cached {
+                Some(true) => return Ok(true),
+                Some(false) => {
+                    // Known non-opaque at this level; walk up.
                 }
-            } else {
-                // Probe and cache. ROOT_PARENT is encoded as "".
-                let probe = if current.is_empty() {
-                    self.lower[lower_idx].join(OPAQUE_WHITEOUT)?
-                } else {
-                    self.lower[lower_idx]
-                        .join(&format!("{}/{}", current, OPAQUE_WHITEOUT))?
-                };
-                let is_opq = probe.exists().unwrap_or(false);
-                self.lower_opaque.write().unwrap().insert(key, is_opq);
-                if is_opq {
-                    return Ok(true);
+                None => {
+                    // Probe and cache. ROOT_PARENT is encoded as "".
+                    let probe = if current.is_empty() {
+                        self.lower[lower_idx].join(OPAQUE_WHITEOUT)?
+                    } else {
+                        self.lower[lower_idx]
+                            .join(&format!("{}/{}", current, OPAQUE_WHITEOUT))?
+                    };
+                    let is_opq = probe.exists().unwrap_or(false);
+                    self.lower_opaque.write().unwrap().insert(key, is_opq);
+                    if is_opq {
+                        return Ok(true);
+                    }
                 }
             }
             if current.is_empty() {
@@ -1254,5 +1263,69 @@ mod tests {
         assert!(!entries.contains(&"file-50".to_string()));
         assert!(entries.contains(&"file-49".to_string()));
         assert!(entries.contains(&"file-149".to_string()));
+    }
+
+    /// Regression: deep-layer resolve hangs because of a self-deadlock
+    /// inside `lower_is_opaque_above`. The previous code wrote:
+    ///
+    /// ```ignore
+    /// if let Some(&is_opq) = self.lower_opaque.read().unwrap().get(&key) {
+    ///     ...
+    /// } else {
+    ///     // Under Rust 2021 edition rules, the read guard from the
+    ///     // condition expression lives until the end of the if/else
+    ///     // block. Acquiring the write lock here deadlocks the same
+    ///     // single thread (rspacefs-mount under fuser is single-threaded).
+    ///     self.lower_opaque.write().unwrap().insert(...);
+    /// }
+    /// ```
+    ///
+    /// This test resolved the deadlock observed live on a k8s test node:
+    /// 14-layer pods (kube-apiserver, etcd, controller-manager) hung in
+    /// `readdir` while 4-layer pods (pause-only sandboxes) worked fine.
+    /// Pause sandbox dirs were small enough that no ancestor probe ever
+    /// missed the cache, so the deadlocking branch was never taken.
+    ///
+    /// The test forces N "ancestor" lookups by querying many distinct
+    /// paths against a 16-layer stack — equivalent to the apiserver
+    /// CreateContainer hot path. It would HANG (not fail) under the bug.
+    #[test]
+    fn test_deep_layer_no_opaque_cache_self_deadlock() {
+        let upper = VfsPath::new(MemoryFS::new());
+        let mut lowers = Vec::with_capacity(16);
+        for i in 0..16 {
+            let l = VfsPath::new(MemoryFS::new());
+            for d in ["etc", "usr/bin", "usr/lib", "var/log", "opt/app/sub"] {
+                l.join(d).unwrap().create_dir_all().unwrap();
+            }
+            l.join(format!("etc/conf-{}", i))
+                .unwrap()
+                .create_file()
+                .unwrap()
+                .write_all(b"v")
+                .unwrap();
+            lowers.push(l);
+        }
+        let ov = VfsPath::new(LayerFS::new(upper, lowers));
+
+        // Resolve a wide set of paths — each one walks all ancestors
+        // through `lower_is_opaque_above`. Under the bug, this hung
+        // indefinitely. A successful return is the regression assertion.
+        for sub in [
+            "etc/conf-0",
+            "etc/conf-15",
+            "usr/bin/x",
+            "usr/lib/y",
+            "var/log/z",
+            "opt/app/sub/w",
+            "etc",
+            "usr",
+            "opt/app",
+        ] {
+            // Don't care about the result, only that it RETURNS.
+            let _ = ov.join(sub).unwrap().exists();
+        }
+        // Sanity: top-layer file IS visible.
+        assert!(ov.join("etc/conf-15").unwrap().exists().unwrap());
     }
 }
