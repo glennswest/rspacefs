@@ -11,6 +11,30 @@ fi
 
 [ "$(id -u)" = "0" ] || die "must run as root"
 
+# ── Distro / kernel guard ───────────────────────────────────────────────
+# Fedora 43 (kernel 6.17) ships an iptables/nftables stack that breaks
+# kube-proxy and Cilium inside their containers ("iptables is not available
+# on this host" / "Unable to redirect iptables binaries"). Until upstream
+# k8s + Cilium ship clean nftables-mode container images, hard-stop on F43.
+# Override with FORCE_DISTRO=1 if you're hunting that bug specifically.
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  case "${VERSION_ID:-unknown}" in
+    42|41)
+      log "distro check OK: ${PRETTY_NAME:-Fedora ${VERSION_ID}}"
+      ;;
+    43|44|45)
+      if [ "${FORCE_DISTRO:-0}" != "1" ]; then
+        die "unsupported distro ${PRETTY_NAME:-Fedora ${VERSION_ID}}: see REIMAGE.md (reimage to Fedora 42). Override with FORCE_DISTRO=1 only if you're debugging the iptables/nftables regression."
+      fi
+      log "WARNING: running on ${PRETTY_NAME} despite FORCE_DISTRO=1 — expect kube-proxy/CNI failures"
+      ;;
+    *)
+      log "distro ${PRETTY_NAME:-Fedora ${VERSION_ID}} not on the tested list (Fedora 41/42); proceeding anyway"
+      ;;
+  esac
+fi
+
 log "disabling swap (and Fedora's zram-generator which re-enables it via /dev/zram0)"
 # Fedora 41+ ships zram-generator-defaults which creates /dev/zram0 as a swap
 # device on every boot. swapoff alone is not enough; kubelet will see zram

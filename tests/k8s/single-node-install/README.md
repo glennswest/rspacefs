@@ -6,12 +6,20 @@ logic can be patched into a Single-Node OpenShift (SNO) installer later.
 
 ## Target
 
-- Fedora 41 / 42 / 43 (any host with dnf, systemd, x86_64 or arm64)
+- **Fedora 42** (kernel 6.11). This is the pinned baseline.
+  - Fedora 43 (kernel 6.17) is NOT supported: kube-proxy's iptables wrapper
+    and Cilium 1.16.x both hit a netfilter regression there and fail with
+    "iptables is not available on this host" / "Unable to redirect iptables
+    binaries". F42 / 6.11 is the last release where mainstream container
+    tooling Just Works without per-component nftables conversion.
+  - Fedora 41 (kernel 6.11/6.12) also works.
 - Kubernetes latest stable (v1.32.x at time of writing)
 - CRI-O 1.32 (matches kube minor)
 - rspacefs-mount as the containers-storage mount_program — every CRI-O
   image pull lands as rspacefs lowerdirs
-- Cilium CNI (production-grade, single-node-friendly, eBPF-native)
+- Flannel CNI by default (small, production-grade, no kernel-version
+  surprises). Set `CNI=cilium` on `05-cni.sh` to use Cilium instead
+  once you're on a kernel/Cilium combo with the iptables issue fixed.
 
 ## Layout
 
