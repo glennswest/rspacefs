@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 2026-05-21
+- **feat (tests/k8s):** Production-quality single-node Kubernetes installer at `tests/k8s/single-node-install/`. Idempotent shell scripts (`01-prereqs` through `06-validate` + `install-all` orchestrator) that bootstrap a real upstream Kubernetes cluster on a Fedora host with CRI-O 1.32 as the runtime and `rspacefs-mount` wired in as the containers-storage `mount_program` from day zero. Cilium (eBPF, kube-proxy-replacement) as the CNI. This is the foundation that the SNO installer patch will reuse — same `storage.conf` shape, same `mount_program` path, same kubelet/CRI-O versions. Includes `uninstall.sh` for clean teardown and `build-bin.sh` for cross-compiling rspacefs-mount + rspacefs-ctl for the target arch.
+
 ### 2026-05-19 (FUSE passthrough)
 - **feat (fuse):** **FUSE passthrough** for read-only opens of non-verified files. Upgraded `fuser` 0.15 → 0.16 with the `abi-7-40` feature (passthrough landed in 0.16, Sep 2025 — saved us a fork). On a kernel ≥ 6.9, `rspacefs-mount` now calls `FUSE_DEV_IOC_BACKING_OPEN` to register the backing fd, then replies with `opened_passthrough(...)`. Subsequent kernel reads bypass our daemon entirely and read direct from the underlying disk. **The daemon is no longer in the hot path for non-verified files.** Tracked layer-by-layer: verity-protected layers (`--lower-verified-pinned`, `--lower-verified`) stay on the daemon path so block hashes are checked; plain `--lower` layers use passthrough. Gracefully falls back to streaming on older kernels (logged at `init`). New `OpenFile::Passthrough { BackingId }` variant holds the kernel-managed backing alive until `release`, where its Drop fires `BACKING_CLOSE`.
 
