@@ -12,6 +12,11 @@ fi
 [ "$(id -u)" = "0" ] || die "must run as root"
 
 log "configuring Kubernetes ${K8S_MINOR} package repo"
+# Upstream docs add `exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni`
+# to prevent `dnf upgrade` from pulling in cross-minor upgrades. dnf5 has
+# no --disable-excludes flag to bypass that on install, so we omit the line
+# entirely. If you later want upgrade-protection, add it back AFTER install:
+#   sudo dnf-config-manager setopt kubernetes.exclude='kubelet kubeadm kubectl'
 cat >/etc/yum.repos.d/kubernetes.repo <<EOF
 [kubernetes]
 name=Kubernetes
@@ -19,18 +24,10 @@ baseurl=https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/rpm/
 enabled=1
 gpgcheck=1
 gpgkey=https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/rpm/repodata/repomd.xml.key
-exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
 log "installing kubelet kubeadm kubectl"
-# dnf5 (Fedora 41+) prints "dnf5 version X.Y.Z" and uses --disable-excludes.
-# dnf4 prints just "X.Y.Z" and uses --disableexcludes.
-if dnf --version 2>&1 | head -1 | grep -q '^dnf5'; then
-  DNF_EXCLUDE_FLAG="--disable-excludes=kubernetes"
-else
-  DNF_EXCLUDE_FLAG="--disableexcludes=kubernetes"
-fi
-dnf -y install $DNF_EXCLUDE_FLAG kubelet kubeadm kubectl >/dev/null
+dnf -y install kubelet kubeadm kubectl >/dev/null
 
 # Pin kubelet cgroup driver to systemd to match CRI-O.
 log "configuring kubelet cgroup driver = systemd"
