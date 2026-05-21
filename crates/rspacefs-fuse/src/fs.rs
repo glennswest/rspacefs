@@ -30,6 +30,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -73,6 +74,16 @@ pub struct RspacefsFuse {
     next_fh: AtomicU64,
     /// open file table: fh → cached content + dirty flag.
     open_files: HashMap<u64, OpenFile>,
+    /// Per-inode BackingId cache. When the same file is opened by multiple
+    /// containers / processes, we register ONE backing fd with the kernel
+    /// (one `BACKING_OPEN` ioctl) and hand each opener a strong reference
+    /// to the shared `Arc<BackingId>`. The kernel reclaims the backing
+    /// when the last opener releases it.
+    ///
+    /// Weak references so that when the strong refs in the open_files
+    /// table go away, the backing is freed. Look up + upgrade on each
+    /// open; if upgrade succeeds, we reuse without a new ioctl.
+    backing_cache: Mutex<HashMap<u64, Weak<BackingId>>>,
     /// uid/gid of the mounting process — used to populate fallback attrs
     /// when the underlying physical file can't be located (shouldn't happen
     /// for well-formed overlays, but `vfs` doesn't promise we can).
@@ -95,9 +106,10 @@ pub struct RspacefsFuse {
 enum OpenFile {
     /// Read-only open of a non-verified file. The kernel reads the backing
     /// file directly via FUSE_PASSTHROUGH; our daemon never sees the
-    /// `read()` ops. We hold the BackingId here so its Drop fires
-    /// (BACKING_CLOSE) when `release` removes this entry.
-    Passthrough { _backing: BackingId },
+    /// `read()` ops. We hold a strong reference to the per-inode shared
+    /// BackingId; when the last opener releases it, Drop fires
+    /// (BACKING_CLOSE) and the kernel reclaims the backing registration.
+    Passthrough { _backing: Arc<BackingId> },
     /// Read-only open with daemon-mediated I/O. Used when the file resolves
     /// to a verity-protected lower (so VerifiedFS hashes each block) or
     /// when passthrough setup fails on older kernels.
@@ -137,6 +149,7 @@ impl RspacefsFuse {
             next_ino: ROOT_INO + 1,
             next_fh: AtomicU64::new(1),
             open_files: HashMap::new(),
+            backing_cache: Mutex::new(HashMap::new()),
             fallback_uid: unsafe { libc::getuid() },
             fallback_gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
@@ -357,6 +370,17 @@ impl Filesystem for RspacefsFuse {
                 "FUSE_PASSTHROUGH enabled — read-only opens of non-verified files bypass the daemon"
             );
         }
+
+        // Perf tuning. The fuser default `max_write` is the FUSE legacy
+        // 32 KB; modern kernels accept up to ~1 MB. Bump it. Same story
+        // for readahead and the in-flight request window. Each of these
+        // is a Result we silently ignore on error — they're hints, not
+        // requirements.
+        let _ = config.set_max_write(1 << 20);          // 1 MB
+        let _ = config.set_max_readahead(1 << 20);      // 1 MB readahead
+        let _ = config.set_max_background(64);          // concurrent requests
+        let _ = config.set_congestion_threshold(48);    // backpressure floor
+
         Ok(())
     }
 
@@ -615,11 +639,29 @@ impl Filesystem for RspacefsFuse {
         if let Some((phys, layer_idx)) = self.physical_for_with_layer(&path) {
             let verified = *self.verified_layers.get(layer_idx).unwrap_or(&false);
             if !verified {
+                // BackingId cache: if this inode already has a live
+                // BackingId (because another open hasn't released yet),
+                // reuse it. One BACKING_OPEN ioctl per file, regardless
+                // of how many concurrent opens exist.
+                let mut cache = match self.backing_cache.lock() {
+                    Ok(c) => c,
+                    Err(_) => return reply.error(EIO),
+                };
+                let existing = cache.get(&ino).and_then(|w| w.upgrade());
+                if let Some(backing) = existing {
+                    drop(cache);
+                    reply.opened_passthrough(fh, 0, &backing);
+                    self.open_files
+                        .insert(fh, OpenFile::Passthrough { _backing: backing });
+                    return;
+                }
+                // Cache miss — try to open + register a fresh backing.
                 if let Ok(backing_file) = std::fs::File::open(&phys) {
                     match reply.open_backing(&backing_file) {
                         Ok(backing) => {
-                            // opened_passthrough consumes the reply but takes
-                            // &BackingId, so we keep ownership.
+                            let backing = Arc::new(backing);
+                            cache.insert(ino, Arc::downgrade(&backing));
+                            drop(cache);
                             reply.opened_passthrough(fh, 0, &backing);
                             self.open_files
                                 .insert(fh, OpenFile::Passthrough { _backing: backing });
@@ -634,6 +676,7 @@ impl Filesystem for RspacefsFuse {
                         }
                     }
                 }
+                drop(cache);
             }
         }
 
