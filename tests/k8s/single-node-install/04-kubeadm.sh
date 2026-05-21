@@ -23,8 +23,9 @@ exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
 log "installing kubelet kubeadm kubectl"
-# dnf5 uses --disable-excludes (dashed); dnf4 uses --disableexcludes (no dash).
-if dnf --version 2>&1 | head -1 | grep -qE '^5\.'; then
+# dnf5 (Fedora 41+) prints "dnf5 version X.Y.Z" and uses --disable-excludes.
+# dnf4 prints just "X.Y.Z" and uses --disableexcludes.
+if dnf --version 2>&1 | head -1 | grep -q '^dnf5'; then
   DNF_EXCLUDE_FLAG="--disable-excludes=kubernetes"
 else
   DNF_EXCLUDE_FLAG="--disableexcludes=kubernetes"
