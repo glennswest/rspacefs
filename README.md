@@ -1,163 +1,181 @@
 # rspacefs
 
-**Pure-Rust userspace LayerFS + dm-verity. No kernel, no NFS, no async.**
+**A tamper-evident, rootless, user-space container rootfs engine for
+OpenShift / Kubernetes — and anywhere else `containers-storage` runs.**
 
-`rspacefs` provides two building blocks for layered, integrity-verified
-container rootfs assembly that previously required kernel modules:
+`rspacefs` plugs into [`containers-storage`](https://github.com/containers/storage)
+via its standard `mount_program` + `additionalimagestores` extension
+points. It replaces (or sits alongside) [`fuse-overlayfs`](https://github.com/containers/fuse-overlayfs)
+as the FUSE helper that assembles container rootfs on every node, and
+adds per-layer cryptographic verification, a live admin surface, and
+streaming reads with kernel-bypass passthrough.
 
-| Crate              | Role                                                                                                     |
-|--------------------|-----------------------------------------------------------------------------------------------------------|
-| `rspacefs-core`    | Userspace LayerFS — merge N read-only lower layers with a writable upper layer, OCI whiteouts, copy-up. |
-| `rspacefs-verity`  | Userspace dm-verity — SHA-256 Merkle tree over 4 KB blocks, per-file manifest, verified-block cache.      |
-| `rspacefs-cli`     | `rspacefs` command-line tool — `overlay ls/cat/stat`, `verity build/verify/inspect`.                      |
-| `rspacefs-fuse`    | `rspacefs-mount` Linux daemon — exposes an overlay (with optional verified lowers) as a real FUSE mount. |
+No new APIs, no new CRDs, no kernel module, no `CAP_SYS_ADMIN`. Just one
+config line in `/etc/containers/storage.conf`:
 
-Both crates expose plain synchronous APIs on top of the
-[`vfs`](https://crates.io/crates/vfs) trait, so you can plug in any backend
-— real disk (`PhysicalFS`), in-memory (`MemoryFS`), S3, a custom block-storage
-driver, anything implementing `vfs::FileSystem`.
-
-This code was originally part of [`nextnfs`](https://github.com/glennswest/nextnfs),
-which served the merged tree over NFS. **rspacefs is fully independent of
-nextnfs.** No NFS, no protocol layer, no network on the hot path — call it
-directly from your container runtime, image-builder, or build tool.
-
-## Why
-
-Layered-rootfs primitives shouldn't require:
-
-- **A kernel module.** Kernel overlayfs needs CAP_SYS_ADMIN, rules out
-  rootless and many embedded targets, and ties you to Linux.
-- **An NFS hop.** A network protocol in the data path is unacceptable for
-  cold-start container provisioning, image build, or any high-IOPS workload.
-- **An async runtime.** Callers pick their own concurrency model. Most
-  callers want straight blocking I/O against a real filesystem.
-
-`rspacefs` is what's left when you strip all that out: ~1,000 LOC of
-overlay logic, ~1,400 LOC of verity, no dependencies beyond `vfs`, `sha2`,
-`serde`. Same semantics as kernel overlayfs and dm-verity, in user-space.
-
-## Quick start
-
-### Library — overlay only
-
-```rust
-use rspacefs_core::LayerFS;
-use vfs::{PhysicalFS, VfsPath};
-
-let upper = VfsPath::new(PhysicalFS::new("/var/lib/myapp/upper".into()));
-let base  = VfsPath::new(PhysicalFS::new("/var/lib/myapp/base".into()));
-let app   = VfsPath::new(PhysicalFS::new("/var/lib/myapp/app".into()));
-
-// Lower layers ordered top-down: index 0 = highest priority.
-let root: VfsPath = LayerFS::new(upper, vec![app, base]).into();
-
-// Use `root` as a regular merged filesystem.
+```toml
+[storage.options]
+mount_program = "/usr/bin/rspacefs-mount"
+additionalimagestores = ["/var/lib/rspacefs/store"]
 ```
 
-### Library — verified read-only layer beneath an overlay
+Then every `oc apply` / `podman run` / `buildah build` on that node
+uses rspacefs underneath.
+
+## What you get on every container
+
+| | Without rspacefs (fuse-overlayfs) | **With rspacefs** |
+|---|---|---|
+| Rootless overlay (no CAP_SYS_ADMIN) | ✅ | ✅ |
+| Per-layer cryptographic verification | ❌ | **SHA-256 Merkle tree per layer; every block hashed on read** |
+| Mixed trust (verified + plain lowers) | ❌ | **Yes — base+deps verified, app code plain, in one mount** |
+| Tamper detection mid-mount | ❌ | **Yes — verified live on Fedora 43 / kernel 6.17 — block-level rejection** |
+| FUSE passthrough for non-verified reads | ❌ | **Yes — kernel reads direct from backing fd; daemon idle on the hot path** |
+| Streaming verified reads | n/a | **O(1) memory regardless of file size; daemon RSS measured at ~6 MB while serving a 64 MB verified file** |
+| Live admin surface (status, invalidate, future verbs) | ❌ | **Yes — `rspacefs ctl` over Unix socket; JSON protocol; verb-extensible** |
+| Symlinks, xattrs (SELinux, capabilities), modes preserved | ✅ | **✅** |
+| Reflink copy-up on btrfs/xfs | partial | **Yes — FICLONE ioctl with byte-copy fallback** |
+| Memory-safe implementation | C | **Rust** |
+
+## Quick install on OpenShift / podman / CRI-O
+
+See [`docs/openshift-integration.md`](docs/openshift-integration.md) for
+the full DaemonSet + verity-staging design. Minimal recipe:
+
+```sh
+# 1. Drop the binary on each node.
+sudo install -m 0755 rspacefs-mount /usr/bin/rspacefs-mount
+
+# 2. Point containers-storage at it.
+cat > /etc/containers/storage.conf <<'EOF'
+[storage]
+driver = "overlay"
+[storage.options]
+mount_program = "/usr/bin/rspacefs-mount"
+additionalimagestores = ["/var/lib/rspacefs/store"]
+mountopt = "nodev"
+EOF
+
+# 3. Use podman / oc / buildah exactly as you always do.
+podman pull docker.io/library/alpine:latest
+podman run --rm alpine /bin/sh -c "echo container served by rspacefs"
+```
+
+Live-tested on Fedora 43 (kernel 6.17.1) with podman 5 — see
+[`tests/integration/podman-mount-program.md`](tests/integration/podman-mount-program.md).
+
+## Architecture
+
+```
+                       OpenShift / Kubernetes node
+   ┌──────────────────────────────────────────────────────────────┐
+   │  CRI-O / podman / buildah                                     │
+   │      │                                                        │
+   │      ▼ image management (pull, store, mount)                  │
+   │  containers-storage  ← reads /etc/containers/storage.conf     │
+   │      │                                                        │
+   │      │ mount_program = /usr/bin/rspacefs-mount                │
+   │      │ additionalimagestores = ["/var/lib/rspacefs/store"]    │
+   │      ▼                                                        │
+   │  ┌──────────────────────────────────────────────────────────┐ │
+   │  │  rspacefs-mount  (FUSE daemon, this repo)                 │ │
+   │  │   ├─ rspacefs-core    — LayerFS merge / whiteout / COW    │ │
+   │  │   ├─ rspacefs-verity  — SHA-256 Merkle + signed manifest  │ │
+   │  │   └─ rspacefs-ctl     — Unix-socket admin surface         │ │
+   │  └──────────────────────────────────────────────────────────┘ │
+   │      │                                                        │
+   │      │ FUSE (with passthrough on kernel ≥ 6.9)                │
+   │      ▼                                                        │
+   │  Merged rootfs at /var/lib/.../overlay/<id>/merged            │
+   │      │                                                        │
+   │      │ runtime pivot_root's here                              │
+   │      ▼                                                        │
+   │  Running container (sees a normal rootfs)                     │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+`mount_program` is what CRI-O exposes today. A proper CRI-O snapshotter
+interface (analogous to containerd's snapshotter model) has been floated
+upstream; when it lands, rspacefs becomes a snapshotter plugin. Until
+then, `mount_program + additionalimagestores` is the correct integration.
+
+## Crates
+
+| Crate | Role |
+|---|---|
+| `rspacefs-core` | LayerFS — merge N read-only lower layers with a writable upper, OCI whiteouts (`.wh.<name>`, `.wh..wh..opq`), copy-up on write. |
+| `rspacefs-verity` | SHA-256 Merkle tree over 4 KB blocks; `LayerManifest` with serde JSON; lock-free verified-block cache; streaming `VerifiedReader` (no whole-file buffer). |
+| `rspacefs-fuse` | `rspacefs-mount` Linux daemon. FUSE adapter supporting passthrough, streaming, symlinks, xattrs, fsync, reflink copy-up, and the `--control-socket` admin surface. Compatible with `containers-storage`'s `mount_program` argv. |
+| `rspacefs-cli` | `rspacefs` command-line tool. Subcommands: `overlay ls/cat/stat`, `verity build/verify/inspect`, `ctl ping/status/invalidate`. |
+
+## Use as a Rust library
+
+For tools that want the layered-FS engine directly without a FUSE mount:
 
 ```rust
 use rspacefs_core::LayerFS;
 use rspacefs_verity::{VerifiedFS, OnFailure};
-use vfs::{MemoryFS, PhysicalFS, VfsPath};
+use vfs::{PhysicalFS, VfsPath};
 
+let upper = VfsPath::new(PhysicalFS::new("/var/lib/myapp/upper".into()));
 let base = VfsPath::new(PhysicalFS::new("/var/lib/myapp/base".into()));
 let base_verified: VfsPath =
-    VerifiedFS::build(base, OnFailure::Reject).unwrap().into();
+    VerifiedFS::load_pinned(base, "base.manifest.json".as_ref(), "base.tree".as_ref(), OnFailure::Reject)?.into();
 
-let upper: VfsPath = MemoryFS::new().into();
-let root: VfsPath = LayerFS::new(upper, vec![base_verified]).into();
-
-// Reads through `root` are tamper-evident. Writes go to `upper`.
+let merged: VfsPath = LayerFS::new(upper, vec![base_verified]).into();
+// merged behaves like a normal vfs::FileSystem — reads are tamper-evident.
 ```
 
-### CLI — inspect / build / verify
-
-```sh
-# Inspect a merged overlay
-rspacefs overlay ls --upper ./upper --lower ./app --lower ./base /etc
-
-rspacefs overlay cat \
-  --upper ./upper --lower ./app --lower ./base /etc/passwd
-
-# Build a verity manifest for a read-only layer
-rspacefs verity build ./base --manifest base.manifest.json --tree base.tree
-
-# Verify it later
-rspacefs verity verify ./base --manifest base.manifest.json
-
-# Pretty-print
-rspacefs verity inspect base.manifest.json
-```
-
-### `rspacefs-mount` — real FUSE mount (Linux)
-
-```sh
-# Plain overlay
-sudo rspacefs-mount \
-  --upper /var/lib/myapp/upper \
-  --lower /var/lib/myapp/app \
-  --lower /var/lib/myapp/base \
-  /mnt/myroot
-
-# Overlay with a verity-protected base
-sudo rspacefs-mount \
-  --upper /var/lib/myapp/upper \
-  --lower-verified /var/lib/myapp/base \
-  --lower /var/lib/myapp/app \
-  /mnt/myroot
-
-# Stop: fusermount -u /mnt/myroot   (or just kill the foreground process)
-```
-
-The binary runs in the foreground, supervises the FUSE channel, and exits
-cleanly on `fusermount -u` or signal. `--auto-unmount` is on by default so
-crashes don't leave a half-attached mount.
-
-Build requires Linux. On a Mac dev box the workspace still builds — the
-binary compiles to a stub that errors out at runtime.
-
-## Workspace layout
-
-```
-rspacefs/
-├── crates/
-│   ├── rspacefs-core/     # LayerFS impl
-│   ├── rspacefs-verity/   # Merkle / verity impl
-│   ├── rspacefs-cli/      # `rspacefs` CLI binary
-│   └── rspacefs-fuse/     # `rspacefs-mount` FUSE daemon (Linux)
-```
+The library is sync, no async runtime. Builds backends are pluggable
+through the [`vfs`](https://crates.io/crates/vfs) trait — `PhysicalFS`,
+`MemoryFS`, or your own.
 
 ## Build & test
 
 ```sh
 make build      # cargo build --workspace --release
-make test       # cargo test --workspace
-make install    # install rspacefs CLI to ~/.cargo/bin
+make test       # cargo test --workspace (71 unit tests + 2 doctests)
+make install    # install rspacefs + rspacefs-mount to ~/.cargo/bin
 ```
 
-Tests are pure unit + integration tests over `MemoryFS`; no privileges needed.
+Workspace builds on macOS too — the FUSE daemon compiles to a stub
+on non-Linux hosts so library development doesn't need a Linux box.
 
-## Design notes
+## Live admin surface
 
-- **No async.** The `vfs::FileSystem` trait is synchronous; that decision
-  flows through. If you need async, wrap calls in your runtime's
-  `spawn_blocking` — we do not want to force `tokio` into every consumer.
-- **Copy-up cost.** First write to a lower-layer file copies the full file
-  content into upper. Same as kernel overlayfs; profile before optimizing
-  with sparse files / reflinks.
-- **Whiteout scan cost.** `is_whiteout` does a per-entry existence check.
-  Adequate for typical OCI layer counts (< 20); revisit if profiling shows
-  hotspots.
-- **Verity verification cost.** First read of each 4 KB block does a
-  log₂(n) Merkle walk (~10 SHA-256s for a 4 MB layer). Subsequent reads
-  hit the lock-free verified-block bitset (~1 ns).
+```sh
+# Start the daemon with a control socket.
+rspacefs-mount --upper /u --lower /l --control-socket /run/rspacefs/foo.sock /mnt
+
+# From anywhere on the same host:
+rspacefs ctl --socket /run/rspacefs/foo.sock status
+rspacefs ctl --socket /run/rspacefs/foo.sock invalidate
+```
+
+Current verbs: `ping`, `status`, `invalidate` (issues
+`FUSE_NOTIFY_INVAL_ENTRY` for every top-level entry).
+
+Planned verbs (same plumbing, new dispatch arms): `verify <layer>`,
+`snapshot <output>`, `swap-lower <index> <path>`,
+`reload-manifest <layer> <manifest> <tree>`.
 
 ## Status
 
-`0.1.0` — extracted from nextnfs `0.13.x`. API surface stable; semantic
-versioning applies.
+`0.1.0` — used in development against Fedora 43 + podman 5; production
+deployments pending. API surface stable; semantic versioning applies.
+
+Active issues at
+[github.com/glennswest/rspacefs/issues](https://github.com/glennswest/rspacefs/issues).
+
+## Secondary use case: NFS-served rootfs for unprivileged container runtimes
+
+If you have a container runtime that **cannot run FUSE in the container**
+(e.g., RouterOS, locked-down embedded), the same rspacefs engine can be
+hosted in a daemon that exports the merged tree over NFSv4. That uses
+[`nextnfs`](https://github.com/glennswest/nextnfs) with its
+`add_rspacefs_export` API, and the container mounts via
+`root-dir=nfs://...`. This is not the product's primary deployment but
+is supported because the engine itself is consumer-agnostic.
 
 ## License
 
