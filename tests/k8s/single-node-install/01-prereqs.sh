@@ -11,7 +11,23 @@ fi
 
 [ "$(id -u)" = "0" ] || die "must run as root"
 
-log "disabling swap"
+log "disabling swap (and Fedora's zram-generator which re-enables it via /dev/zram0)"
+# Fedora 41+ ships zram-generator-defaults which creates /dev/zram0 as a swap
+# device on every boot. swapoff alone is not enough; kubelet will see zram
+# swap re-enable shortly after and exit with --fail-swap-on=true. Remove
+# the defaults package or write an override that sets zram-size = 0.
+if rpm -q zram-generator-defaults >/dev/null 2>&1; then
+  log "removing zram-generator-defaults"
+  dnf -y remove zram-generator-defaults >/dev/null
+fi
+# Also drop a config override in case zram-generator itself remains.
+install -d /etc/systemd/zram-generator.conf.d
+cat >/etc/systemd/zram-generator.conf.d/00-disable.conf <<'EOF'
+[zram0]
+zram-size = 0
+EOF
+# Stop any existing zram swap.
+systemctl stop dev-zram0.swap 2>/dev/null || true
 swapoff -a
 sed -i.bak -E 's|^(\s*[^#].*\s+swap\s+.*)$|# \1|' /etc/fstab
 
