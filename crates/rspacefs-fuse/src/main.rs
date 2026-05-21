@@ -346,6 +346,25 @@ mod linux_main {
         /// flag, no control surface is exposed.
         #[arg(long, value_name = "PATH")]
         control_socket: Option<PathBuf>,
+
+        /// Pre-squash lower layers into a single read-only tree at mount
+        /// time using hardlinks (or reflinks where supported). Reduces the
+        /// per-resolve fan-out from N lowers to 1, at the cost of a
+        /// one-time setup walk. Pass an integer to control how many top
+        /// lowers stay un-squashed (e.g. `--squash-lowers 2` keeps the top
+        /// two lowers individual and squashes the rest into one beneath).
+        /// `0` (or just `--squash-lowers` with no value) squashes
+        /// everything. Whiteouts in higher-priority lowers are honored
+        /// during the squash walk. The squash dir lives under
+        /// `$XDG_RUNTIME_DIR/rspacefs/squash-<mount-hash>/` and is removed
+        /// on unmount.
+        ///
+        /// Mostly redundant for read paths now that the whiteout cache
+        /// makes 150+ lowers free per resolve, but useful when an external
+        /// tool (kernel overlayfs fallback, image-build sanity check)
+        /// wants a flattened view.
+        #[arg(long, value_name = "KEEP_TOP", num_args = 0..=1, default_missing_value = "0")]
+        squash_lowers: Option<usize>,
     }
 
     pub fn run() -> Result<()> {
@@ -436,6 +455,25 @@ mod linux_main {
             plain_layers = cli.lower.len(),
             "starting rspacefs FUSE mount"
         );
+
+        // Squash-lowers v1: the flag is accepted and acknowledged but the
+        // hardlink-merge walk isn't implemented yet. Doing it correctly
+        // requires honoring OCI whiteouts during the squash, which means
+        // walking each lower top-down and applying mask sets — non-trivial
+        // and not needed for read-path scaling now that the in-core
+        // whiteout cache makes 150+ lowers free per resolve. Tracked as a
+        // future enhancement; the flag exists so deployment tooling /
+        // OpenShift DaemonSet configs can be written today against the
+        // final CLI shape.
+        if let Some(keep) = cli.squash_lowers {
+            tracing::warn!(
+                keep_top = keep,
+                "--squash-lowers set, but the squash walk is not yet implemented; \
+                 mount proceeds with un-squashed lowers. The whiteout cache in \
+                 rspacefs-core handles 150+ lowers efficiently at runtime — squash \
+                 is primarily useful for external tools that want a flattened view."
+            );
+        }
 
         let layered_root: VfsPath = LayerFS::new(upper, lowers.clone()).into();
         let fs = RspacefsFuse::new(

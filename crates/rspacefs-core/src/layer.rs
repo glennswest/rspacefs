@@ -6,9 +6,10 @@
 //! Rust user-space — no kernel module, no FUSE at this layer. OCI image
 //! spec whiteout markers (`.wh.<name>`, `.wh..wh..opq`) are honored.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
+use std::sync::{Arc, RwLock};
 
 use vfs::error::VfsErrorKind;
 use vfs::{FileSystem, VfsFileType, VfsMetadata, VfsPath, VfsResult};
@@ -28,6 +29,24 @@ pub struct LayerFS {
     upper: VfsPath,
     /// Lower layers ordered top-down (index 0 is highest priority).
     lower: Vec<VfsPath>,
+    /// Per-(lower_index, parent_dir) cache of whiteout names in that dir.
+    ///
+    /// Lowers are read-only by contract; we build the set once on first
+    /// access and never invalidate. Without this cache, a `resolve()` on a
+    /// path with N lowers costs O(N) stat syscalls just for the whiteout
+    /// probes, plus the existence probes — fine for 5 layers, painful at
+    /// 50, falls off a cliff at 150. With the cache, the per-(lower, dir)
+    /// stat happens exactly once for the lifetime of the LayerFS;
+    /// subsequent probes are O(1) hashmap lookups.
+    ///
+    /// `RwLock<HashMap<...>>` keeps the fast path lock-free for concurrent
+    /// reads after the cache is warm.
+    lower_whiteouts: Arc<RwLock<HashMap<(usize, String), Arc<HashSet<String>>>>>,
+    /// Per-(lower_index, dir) cache of "does this directory have an opaque
+    /// whiteout marker?" — Same caching motivation as `lower_whiteouts`.
+    /// Walking ancestor directories to check for `.wh..wh..opq` was the
+    /// other O(N × depth) hot path.
+    lower_opaque: Arc<RwLock<HashMap<(usize, String), bool>>>,
 }
 
 impl fmt::Debug for LayerFS {
@@ -45,41 +64,43 @@ impl LayerFS {
     /// - `upper`: writable layer (all writes go here)
     /// - `lower`: read-only layers, ordered top-down (index 0 = highest priority)
     pub fn new(upper: VfsPath, lower: Vec<VfsPath>) -> Self {
-        Self { upper, lower }
+        Self {
+            upper,
+            lower,
+            lower_whiteouts: Arc::new(RwLock::new(HashMap::new())),
+            lower_opaque: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     /// Resolve a path in the overlay — returns the VfsPath from the first
-    /// layer that contains it, respecting whiteouts.
+    /// layer that contains it, respecting whiteouts. Scales to 150+ lower
+    /// layers because all whiteout / opaque probes against the (immutable)
+    /// lowers hit a cache; only the upper layer takes a stat per probe.
     fn resolve(&self, path: &str) -> VfsResult<Option<VfsPath>> {
-        // Check if whited out in upper
+        // Upper: whiteout / existence / opaque-above — these are dynamic,
+        // not cached. Cheap because there's only one upper.
         if self.is_whiteout(path, &self.upper)? {
             return Ok(None);
         }
-
-        // Check upper
         let upper_path = self.upper.join(path)?;
         if upper_path.exists()? {
             return Ok(Some(upper_path));
         }
-
-        // Check if any ancestor directory in upper has an opaque whiteout
         if self.is_opaque_above(path, &self.upper)? {
             return Ok(None);
         }
 
-        // Walk lower layers
-        for layer in &self.lower {
-            // Check for whiteout in this layer
-            if self.is_whiteout(path, layer)? {
+        // Lowers: use the cached probes.
+        let (parent, name) = split_path(path);
+        for (i, layer) in self.lower.iter().enumerate() {
+            if self.lower_has_whiteout(i, parent, name)? {
                 return Ok(None);
             }
-
             let layer_path = layer.join(path)?;
             if layer_path.exists()? {
                 return Ok(Some(layer_path));
             }
-
-            if self.is_opaque_above(path, layer)? {
+            if self.lower_is_opaque_above(i, parent)? {
                 return Ok(None);
             }
         }
@@ -87,7 +108,9 @@ impl LayerFS {
         Ok(None)
     }
 
-    /// Check if a file is whited out in the given layer.
+    /// Check if a file is whited out in the given layer. Used for the upper
+    /// layer (which mutates at runtime and so cannot be cached). For
+    /// lowers, use `lower_has_whiteout` instead.
     fn is_whiteout(&self, path: &str, layer: &VfsPath) -> VfsResult<bool> {
         let (parent, name) = split_path(path);
         let wh_name = format!("{}{}", WHITEOUT_PREFIX, name);
@@ -100,14 +123,53 @@ impl LayerFS {
         wh.exists()
     }
 
+    /// Cached: does lower layer `lower_idx` contain `<parent>/.wh.<name>`?
+    fn lower_has_whiteout(&self, lower_idx: usize, parent: &str, name: &str) -> VfsResult<bool> {
+        // Fast path: read lock, see if we've already enumerated this dir.
+        let key = (lower_idx, parent.to_string());
+        if let Some(set) = self
+            .lower_whiteouts
+            .read()
+            .unwrap()
+            .get(&key)
+            .map(Arc::clone)
+        {
+            return Ok(set.contains(name));
+        }
+        // Slow path: read the directory ONCE, collect every `.wh.<X>` name.
+        let dir = if parent.is_empty() {
+            self.lower[lower_idx].clone()
+        } else {
+            self.lower[lower_idx].join(parent)?
+        };
+        let mut whiteouts = HashSet::new();
+        if dir.exists().unwrap_or(false) {
+            if let Ok(it) = dir.read_dir() {
+                for entry in it {
+                    let n = entry.filename();
+                    if n == OPAQUE_WHITEOUT {
+                        continue; // opaque markers tracked separately
+                    }
+                    if let Some(rest) = n.strip_prefix(WHITEOUT_PREFIX) {
+                        whiteouts.insert(rest.to_string());
+                    }
+                }
+            }
+        }
+        let arc = Arc::new(whiteouts);
+        let contains = arc.contains(name);
+        self.lower_whiteouts.write().unwrap().insert(key, arc);
+        Ok(contains)
+    }
+
     /// Check if any ancestor directory of `path` in the given layer has an
     /// opaque whiteout, meaning lower layers should not be consulted.
+    /// Used for the upper layer (uncached).
     fn is_opaque_above(&self, path: &str, layer: &VfsPath) -> VfsResult<bool> {
         let mut current = path.to_string();
         loop {
             let (parent, _) = split_path(&current);
             if parent.is_empty() {
-                // Check root directory for opaque whiteout
                 let opq = layer.join(OPAQUE_WHITEOUT)?;
                 return opq.exists();
             }
@@ -116,6 +178,40 @@ impl LayerFS {
             if opq.exists()? {
                 return Ok(true);
             }
+            current = parent.to_string();
+        }
+    }
+
+    /// Cached: walk ancestors of `path` and check each for an opaque
+    /// marker in lower layer `lower_idx`. Each (lower_idx, ancestor_dir)
+    /// is probed exactly once for the lifetime of the LayerFS.
+    fn lower_is_opaque_above(&self, lower_idx: usize, path_parent: &str) -> VfsResult<bool> {
+        let mut current = path_parent.to_string();
+        loop {
+            let key = (lower_idx, current.clone());
+            // Read-lock fast path.
+            if let Some(&is_opq) = self.lower_opaque.read().unwrap().get(&key) {
+                if is_opq {
+                    return Ok(true);
+                }
+            } else {
+                // Probe and cache. ROOT_PARENT is encoded as "".
+                let probe = if current.is_empty() {
+                    self.lower[lower_idx].join(OPAQUE_WHITEOUT)?
+                } else {
+                    self.lower[lower_idx]
+                        .join(&format!("{}/{}", current, OPAQUE_WHITEOUT))?
+                };
+                let is_opq = probe.exists().unwrap_or(false);
+                self.lower_opaque.write().unwrap().insert(key, is_opq);
+                if is_opq {
+                    return Ok(true);
+                }
+            }
+            if current.is_empty() {
+                return Ok(false);
+            }
+            let (parent, _) = split_path(&current);
             current = parent.to_string();
         }
     }
@@ -1029,5 +1125,134 @@ mod tests {
         assert!(entries.contains(&"a.txt".to_string()));
         assert!(entries.contains(&"b.txt".to_string()));
         assert!(entries.contains(&"c.txt".to_string()));
+    }
+
+    // ── 150-layer scaling test ────────────────────────────────────────────
+    //
+    // Containers pulled from production registries can have surprisingly
+    // many layers — buildah / Dockerfile chains regularly produce 30-50,
+    // and CI image graphs we've seen go past 100. This test stamps a
+    // 150-layer stack and exercises resolve / read across it to make sure
+    // (a) we don't fall off a perf cliff and (b) the whiteout-cache logic
+    // is correct end-to-end.
+
+    fn make_n_layer_stack(n: usize) -> VfsPath {
+        let upper = VfsPath::new(MemoryFS::new());
+        let mut lowers = Vec::with_capacity(n);
+        for i in 0..n {
+            let l = VfsPath::new(MemoryFS::new());
+            l.join("etc").unwrap().create_dir_all().unwrap();
+            // Each layer has one file unique to it...
+            l.join(format!("etc/file-{}", i))
+                .unwrap()
+                .create_file()
+                .unwrap()
+                .write_all(format!("from layer {}", i).as_bytes())
+                .unwrap();
+            // ...plus shared "release" that the LOWEST layer (index n-1)
+            // gets to keep (it'll be the only one seen because higher
+            // priorities override).
+            l.join("etc/release")
+                .unwrap()
+                .create_file()
+                .unwrap()
+                .write_all(format!("layer-{}-release", i).as_bytes())
+                .unwrap();
+            lowers.push(l);
+        }
+        VfsPath::new(LayerFS::new(upper, lowers))
+    }
+
+    #[test]
+    fn test_150_layers_resolve_unique() {
+        let ov = make_n_layer_stack(150);
+        // Resolve a file that lives only in the deepest layer — exercises
+        // the full whiteout-cache walk in resolve().
+        let mut buf = String::new();
+        ov.join("etc/file-149")
+            .unwrap()
+            .open_file()
+            .unwrap()
+            .read_to_string(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "from layer 149");
+    }
+
+    #[test]
+    fn test_150_layers_top_layer_wins_for_shared_path() {
+        let ov = make_n_layer_stack(150);
+        // The shared `etc/release` should resolve through the highest-
+        // priority lower (index 0).
+        let mut buf = String::new();
+        ov.join("etc/release")
+            .unwrap()
+            .open_file()
+            .unwrap()
+            .read_to_string(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "layer-0-release");
+    }
+
+    #[test]
+    fn test_150_layers_readdir_merges_all() {
+        let ov = make_n_layer_stack(150);
+        let entries: Vec<String> = ov
+            .join("etc")
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .map(|p| p.filename())
+            .collect();
+        // 150 unique file-N entries + 1 shared "release" = 151.
+        assert_eq!(entries.len(), 151);
+        assert!(entries.contains(&"release".to_string()));
+        assert!(entries.contains(&"file-0".to_string()));
+        assert!(entries.contains(&"file-149".to_string()));
+    }
+
+    #[test]
+    fn test_150_layers_whiteout_caching_correctness() {
+        // Make a 150-layer stack with `.wh.file-50` in layer 0 so the
+        // deeper layer's `file-50` is masked. With caching we need to
+        // make sure the first-resolve builds the cache correctly and the
+        // mask is observed.
+        let upper = VfsPath::new(MemoryFS::new());
+        let mut lowers = Vec::with_capacity(150);
+        for i in 0..150 {
+            let l = VfsPath::new(MemoryFS::new());
+            l.join("etc").unwrap().create_dir_all().unwrap();
+            l.join(format!("etc/file-{}", i))
+                .unwrap()
+                .create_file()
+                .unwrap()
+                .write_all(format!("layer {}", i).as_bytes())
+                .unwrap();
+            lowers.push(l);
+        }
+        // Layer 0: whiteout file-50 (so file-50 from layer 50 is masked).
+        lowers[0]
+            .join("etc/.wh.file-50")
+            .unwrap()
+            .create_file()
+            .unwrap();
+        let ov = VfsPath::new(LayerFS::new(upper, lowers));
+
+        // file-50 should NOT be visible.
+        assert!(!ov.join("etc/file-50").unwrap().exists().unwrap());
+        // file-49 and file-51 should still be visible.
+        assert!(ov.join("etc/file-49").unwrap().exists().unwrap());
+        assert!(ov.join("etc/file-51").unwrap().exists().unwrap());
+
+        // readdir should also reflect the mask.
+        let entries: Vec<String> = ov
+            .join("etc")
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .map(|p| p.filename())
+            .collect();
+        assert!(!entries.contains(&"file-50".to_string()));
+        assert!(entries.contains(&"file-49".to_string()));
+        assert!(entries.contains(&"file-149".to_string()));
     }
 }

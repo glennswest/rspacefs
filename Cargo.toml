@@ -16,6 +16,22 @@ repository = "https://github.com/glennswest/rspacefs"
 rust-version = "1.75"
 description = "Pure-Rust userspace LayerFS and dm-verity. No NFS, no kernel, no async — direct file I/O via the vfs trait."
 
+# Release-profile tuning. The mount daemon is hot — every container start
+# on every cluster node exercises it. Squeeze fixed-overhead out at compile
+# time before doing it at run time.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# Profile for PGO-instrumented builds. Run an instrumented binary against
+# a representative workload, collect profile data, then rebuild with
+# RUSTFLAGS="-C profile-use=/path/to/merged.profdata" --profile=release.
+[profile.release-pgo]
+inherits = "release"
+
 [workspace.dependencies]
 vfs = "0.12"
 sha2 = "0.10"
