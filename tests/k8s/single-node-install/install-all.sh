@@ -23,3 +23,11 @@ bash "${HERE}/06-validate.sh"
 log "==== install complete ===="
 log "kubeconfig: /etc/kubernetes/admin.conf (also \$HOME/.kube/config)"
 log "next: deploy beatup/benchmark workloads from tests/k8s/workloads/"
+
+# Drop a snapshot of the just-built environment so we can reproduce it later.
+# Best-effort — failure here doesn't break the install.
+CAP="${HERE}/../env-capture/capture-env.sh"
+if [ -x "$CAP" ]; then
+  log "capturing env snapshot"
+  bash "$CAP" --purpose bootstrap || log "(env snapshot failed; not fatal)"
+fi

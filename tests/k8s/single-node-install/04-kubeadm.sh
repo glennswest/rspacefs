@@ -51,16 +51,15 @@ done
 [ -S /var/run/crio/crio.sock ] || die "crio socket not present after 10s — check 'systemctl status crio'"
 
 log "running kubeadm init (this can take ~60s while it pulls control-plane images)"
-# --pod-network-cidr matches what we'll tell Cilium.
+# --pod-network-cidr matches what we'll tell the CNI. We keep kube-proxy
+# (no --skip-phases) because flannel needs it. If you switch CNI=cilium
+# in 05-cni and want Cilium's eBPF dataplane to replace kube-proxy, add
+# back --skip-phases=addon/kube-proxy here.
 kubeadm init \
   --pod-network-cidr="${POD_CIDR}" \
   --service-cidr="${SERVICE_CIDR}" \
   --cri-socket=unix:///var/run/crio/crio.sock \
-  --skip-phases=addon/kube-proxy \
   | tee /var/log/kubeadm-init.log
-
-# Skipping kube-proxy because Cilium replaces it. If you want kube-proxy
-# instead of Cilium's eBPF dataplane, drop the --skip-phases flag.
 
 log "setting up kubeconfig for the invoking user"
 INSTALL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
