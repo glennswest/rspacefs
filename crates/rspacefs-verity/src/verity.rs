@@ -149,7 +149,7 @@ impl MerkleTree {
 
             manifest_files.push(FileEntry {
                 path: path.clone(),
-                size: size as u64,
+                size,
                 content_hash,
                 metadata_hash,
                 block_range: (block_start, block_end),

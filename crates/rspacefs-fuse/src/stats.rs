@@ -1,3 +1,10 @@
+// Stats wiring is half-done: counters are bumped from every FUSE op,
+// but the control-socket commands that expose `snapshot()`, `recent()`,
+// and `render_prom()` haven't shipped yet (task #8 — control protocol
+// expansion). The dead_code allow goes away as soon as control.rs grows
+// `Request::Stats` / `Request::MetricsText` / `Request::Ops` arms.
+#![allow(dead_code)]
+
 //! Operational telemetry for `rspacefs-mount`.
 //!
 //! Every FUSE op increments a counter; reads/writes also accumulate bytes.
