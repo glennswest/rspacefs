@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rspacefs_core::LayerFS;
-use rspacefs_verity::{
-    LayerManifest, MerkleTree, OnFailure, VerifiedLayerVfs, BLOCK_SIZE,
-};
+use rspacefs_verity::{LayerManifest, MerkleTree, OnFailure, VerifiedLayerVfs, BLOCK_SIZE};
 use vfs::{PhysicalFS, VfsPath};
 
 #[derive(Parser)]
@@ -114,9 +112,7 @@ enum VerityOp {
         warn_only: bool,
     },
     /// Pretty-print a manifest JSON file (root hash, file count, etc.).
-    Inspect {
-        manifest: PathBuf,
-    },
+    Inspect { manifest: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -195,22 +191,14 @@ fn run_overlay(op: OverlayOp) -> Result<()> {
                 println!("{}", name);
             }
         }
-        OverlayOp::Cat {
-            upper,
-            lower,
-            path,
-        } => {
+        OverlayOp::Cat { upper, lower, path } => {
             let root = build_overlay(upper, lower)?;
             let mut file = root.join(&path)?.open_file()?;
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)?;
             std::io::stdout().write_all(&buf)?;
         }
-        OverlayOp::Stat {
-            upper,
-            lower,
-            path,
-        } => {
+        OverlayOp::Stat { upper, lower, path } => {
             let root = build_overlay(upper.clone(), lower.clone())?;
             let p = root.join(&path)?;
             if !p.exists()? {
@@ -269,7 +257,11 @@ fn run_verity(op: VerityOp) -> Result<()> {
             if let Some(t) = tree {
                 fs::write(&t, merkle.to_bytes())
                     .with_context(|| format!("writing tree to {}", t.display()))?;
-                eprintln!("wrote tree to {} ({} nodes)", t.display(), merkle.node_count());
+                eprintln!(
+                    "wrote tree to {} ({} nodes)",
+                    t.display(),
+                    merkle.node_count()
+                );
             }
 
             eprintln!(
@@ -279,7 +271,11 @@ fn run_verity(op: VerityOp) -> Result<()> {
                     .map(|b| format!("{:02x}", b))
                     .collect::<String>()
             );
-            eprintln!("files: {}, block_size: {} bytes", mf.files.len(), BLOCK_SIZE);
+            eprintln!(
+                "files: {}, block_size: {} bytes",
+                mf.files.len(),
+                BLOCK_SIZE
+            );
         }
         VerityOp::Verify {
             dir,
@@ -297,7 +293,10 @@ fn run_verity(op: VerityOp) -> Result<()> {
             if rebuilt.root_hash() != mf.root_hash {
                 eprintln!(
                     "expected root: {}",
-                    mf.root_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                    mf.root_hash
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
                 );
                 eprintln!(
                     "computed root: {}",
@@ -314,9 +313,12 @@ fn run_verity(op: VerityOp) -> Result<()> {
                 }
             }
 
-            let mode = if warn_only { OnFailure::Warn } else { OnFailure::Reject };
-            let verified =
-                VerifiedLayerVfs::new(root, rebuilt, current_mf, mf.root_hash, mode);
+            let mode = if warn_only {
+                OnFailure::Warn
+            } else {
+                OnFailure::Reject
+            };
+            let verified = VerifiedLayerVfs::new(root, rebuilt, current_mf, mf.root_hash, mode);
             let (checked, failed) = verified
                 .full_check()
                 .map_err(|e| anyhow!("running full_check: {e}"))?;

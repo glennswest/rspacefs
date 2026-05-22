@@ -67,17 +67,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open_file()?
         .read_to_string(&mut buf)?;
     println!("/etc/release (after append)    -> {:?}", buf);
-    println!("upper has it now?              -> {}",
-        upper.join("etc/release")?.exists()?);
+    println!(
+        "upper has it now?              -> {}",
+        upper.join("etc/release")?.exists()?
+    );
 
     println!("\n=== delete creates a whiteout marker ===");
     root.join("etc/hostname")?.remove_file()?;
-    println!("/etc/hostname exists in view?  -> {}",
-        root.join("etc/hostname")?.exists()?);
+    println!(
+        "/etc/hostname exists in view?  -> {}",
+        root.join("etc/hostname")?.exists()?
+    );
     let wh_name = format!("{}{}", WHITEOUT_PREFIX, "hostname");
     let upper_path = format!("etc/{}", wh_name);
-    println!("upper has .wh.hostname?        -> {}",
-        upper.join(&upper_path)?.exists()?);
+    println!(
+        "upper has .wh.hostname?        -> {}",
+        upper.join(&upper_path)?.exists()?
+    );
     println!("(opaque whiteout would be {})", OPAQUE_WHITEOUT);
 
     Ok(())

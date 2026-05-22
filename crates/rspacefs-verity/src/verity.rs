@@ -198,7 +198,12 @@ impl MerkleTree {
     ///
     /// Hashes the block and walks the authentication path from leaf to root.
     /// Returns `true` if the computed root matches `expected_root`.
-    pub fn verify_block(&self, block_index: usize, block_data: &[u8], expected_root: &Hash256) -> bool {
+    pub fn verify_block(
+        &self,
+        block_index: usize,
+        block_data: &[u8],
+        expected_root: &Hash256,
+    ) -> bool {
         if block_index >= self.padded_leaf_count {
             return false;
         }
@@ -565,7 +570,10 @@ impl VerifiedLayerVfs {
             // For simplicity, re-read the block from the underlying VFS.
             let block_data = self.read_raw_block(path, (block_offset + i) * BLOCK_SIZE)?;
 
-            if self.tree.verify_block(global_block, &block_data, &self.root_hash) {
+            if self
+                .tree
+                .verify_block(global_block, &block_data, &self.root_hash)
+            {
                 self.cache.mark_verified(global_block);
             } else {
                 tracing::error!(
@@ -596,7 +604,12 @@ impl VerifiedLayerVfs {
 
     /// Read a raw block from the underlying VFS for verification.
     fn read_raw_block(&self, path: &str, offset: usize) -> io::Result<Vec<u8>> {
-        let file = self.inner.join(path).map_err(io_err)?.open_file().map_err(io_err)?;
+        let file = self
+            .inner
+            .join(path)
+            .map_err(io_err)?
+            .open_file()
+            .map_err(io_err)?;
         let mut buf = vec![0u8; BLOCK_SIZE];
         let mut reader = file;
 
@@ -625,7 +638,12 @@ impl VerifiedLayerVfs {
         let mut failed = 0;
 
         for entry in &self.manifest.files {
-            let file = self.inner.join(&entry.path).map_err(io_err)?.open_file().map_err(io_err)?;
+            let file = self
+                .inner
+                .join(&entry.path)
+                .map_err(io_err)?
+                .open_file()
+                .map_err(io_err)?;
             let mut reader = file;
             let mut block_idx = entry.block_range.0;
 
@@ -673,7 +691,11 @@ impl VerifiedLayerVfs {
 
 impl std::fmt::Debug for VerifiedLayerVfs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hex: String = self.root_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let hex: String = self
+            .root_hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
         f.debug_struct("VerifiedLayerVfs")
             .field("root_hash", &hex)
             .field("files", &self.manifest.files.len())
@@ -736,11 +758,10 @@ impl VerifiedReader {
 
         // Verify against tree (with or without the per-block cache).
         let global_block = self.entry.block_range.0 + block_idx;
-        let trusted = self.layer.tree.verify_block(
-            global_block,
-            &block_data,
-            &self.layer.root_hash,
-        );
+        let trusted =
+            self.layer
+                .tree
+                .verify_block(global_block, &block_data, &self.layer.root_hash);
         if trusted {
             self.layer.cache.mark_verified(global_block);
         } else {
@@ -793,8 +814,7 @@ impl io::Read for VerifiedReader {
             if copy == 0 {
                 break;
             }
-            out[written..written + copy]
-                .copy_from_slice(&block[block_offset..block_offset + copy]);
+            out[written..written + copy].copy_from_slice(&block[block_offset..block_offset + copy]);
             written += copy;
             self.position += copy as u64;
         }
@@ -946,7 +966,11 @@ impl FileSystem for VerifiedFS {
                 ))))
             })?;
 
-        Ok(Box::new(VerifiedReader::new(inner_reader, self.inner.clone(), entry)))
+        Ok(Box::new(VerifiedReader::new(
+            inner_reader,
+            self.inner.clone(),
+            entry,
+        )))
     }
 
     fn create_file(&self, _path: &str) -> VfsResult<Box<dyn SeekAndWrite + Send>> {
@@ -1011,11 +1035,7 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
 }
 
 /// Recursively collect all files from a VFS directory tree into a sorted map.
-fn collect_files(
-    root: &VfsPath,
-    prefix: &str,
-    files: &mut BTreeMap<String, ()>,
-) -> io::Result<()> {
+fn collect_files(root: &VfsPath, prefix: &str, files: &mut BTreeMap<String, ()>) -> io::Result<()> {
     let path = if prefix.is_empty() {
         root.clone()
     } else {
@@ -1055,7 +1075,7 @@ mod tests {
         let tree = MerkleTree::build(&[]);
         assert_eq!(tree.leaf_count(), 1);
         assert_eq!(tree.node_count(), 1); // single leaf = single node
-        // Root should be hash of a zero-padded block.
+                                          // Root should be hash of a zero-padded block.
         let expected = hash_block(&[]);
         assert_eq!(tree.root_hash(), expected);
     }
@@ -1118,7 +1138,11 @@ mod tests {
 
         for i in 0..4 {
             let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-            assert!(tree.verify_block(i, block, &root), "block {} should verify", i);
+            assert!(
+                tree.verify_block(i, block, &root),
+                "block {} should verify",
+                i
+            );
         }
     }
 
@@ -1298,7 +1322,11 @@ mod tests {
         }
         {
             use std::io::Write;
-            let mut f = root.join("usr/lib/libtest.so").unwrap().create_file().unwrap();
+            let mut f = root
+                .join("usr/lib/libtest.so")
+                .unwrap()
+                .create_file()
+                .unwrap();
             let data = vec![0xEFu8; 8192]; // 2 blocks
             f.write_all(&data).unwrap();
         }
@@ -1361,7 +1389,9 @@ mod tests {
 
         // Read a file and verify it.
         let data = b"key=value\n";
-        verified.verify_file_blocks("etc/config.txt", data, 0).unwrap();
+        verified
+            .verify_file_blocks("etc/config.txt", data, 0)
+            .unwrap();
         assert!(verified.cache().verified_count() > 0);
     }
 
@@ -1418,7 +1448,11 @@ mod tests {
         // Verify every block.
         for i in 0..256 {
             let block = &data[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
-            assert!(tree.verify_block(i, block, &root), "block {} should verify", i);
+            assert!(
+                tree.verify_block(i, block, &root),
+                "block {} should verify",
+                i
+            );
         }
 
         // Corrupt block 128 and verify it fails.
@@ -1458,7 +1492,11 @@ mod tests {
         let vfs_path: VfsPath = vfs.into();
 
         // Open and read a file through the verified VFS.
-        let mut file = vfs_path.join("etc/config.txt").unwrap().open_file().unwrap();
+        let mut file = vfs_path
+            .join("etc/config.txt")
+            .unwrap()
+            .open_file()
+            .unwrap();
         let mut buf = String::new();
         file.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "key=value\n");
@@ -1510,7 +1548,11 @@ mod tests {
         // Write operations should fail on a read-only verified layer.
         assert!(vfs_path.join("new_file").unwrap().create_file().is_err());
         assert!(vfs_path.join("new_dir").unwrap().create_dir().is_err());
-        assert!(vfs_path.join("etc/config.txt").unwrap().remove_file().is_err());
+        assert!(vfs_path
+            .join("etc/config.txt")
+            .unwrap()
+            .remove_file()
+            .is_err());
     }
 
     #[test]
@@ -1536,11 +1578,7 @@ mod tests {
         assert_eq!(buf, "key=value\n");
 
         // Listing should work through the overlay.
-        let entries: Vec<String> = ov_path
-            .read_dir()
-            .unwrap()
-            .map(|e| e.filename())
-            .collect();
+        let entries: Vec<String> = ov_path.read_dir().unwrap().map(|e| e.filename()).collect();
         assert!(entries.contains(&"etc".to_string()));
         assert!(entries.contains(&"usr".to_string()));
     }
@@ -1590,7 +1628,11 @@ mod tests {
         let vfs_path: VfsPath = vfs.into();
 
         // Reading a file should populate the cache.
-        let mut file = vfs_path.join("etc/config.txt").unwrap().open_file().unwrap();
+        let mut file = vfs_path
+            .join("etc/config.txt")
+            .unwrap()
+            .open_file()
+            .unwrap();
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"key=value\n");

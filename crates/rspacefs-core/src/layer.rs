@@ -20,6 +20,10 @@ pub const WHITEOUT_PREFIX: &str = ".wh.";
 /// Opaque whiteout marker — blocks all lower layer entries in a directory.
 pub const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
+/// Per-(lower_index, parent_dir) cache of "what whiteout names exist
+/// in this directory?". Built lazily on first probe of a given dir.
+type WhiteoutCache = Arc<RwLock<HashMap<(usize, String), Arc<HashSet<String>>>>>;
+
 /// LayerFS virtual filesystem.
 ///
 /// Merges a writable `upper` layer with zero or more read-only `lower` layers.
@@ -41,7 +45,7 @@ pub struct LayerFS {
     ///
     /// `RwLock<HashMap<...>>` keeps the fast path lock-free for concurrent
     /// reads after the cache is warm.
-    lower_whiteouts: Arc<RwLock<HashMap<(usize, String), Arc<HashSet<String>>>>>,
+    lower_whiteouts: WhiteoutCache,
     /// Per-(lower_index, dir) cache of "does this directory have an opaque
     /// whiteout marker?" — Same caching motivation as `lower_whiteouts`.
     /// Walking ancestor directories to check for `.wh..wh..opq` was the
@@ -207,8 +211,7 @@ impl LayerFS {
                     let probe = if current.is_empty() {
                         self.lower[lower_idx].join(OPAQUE_WHITEOUT)?
                     } else {
-                        self.lower[lower_idx]
-                            .join(&format!("{}/{}", current, OPAQUE_WHITEOUT))?
+                        self.lower[lower_idx].join(format!("{}/{}", current, OPAQUE_WHITEOUT))?
                     };
                     let is_opq = probe.exists().unwrap_or(false);
                     self.lower_opaque.write().unwrap().insert(key, is_opq);
@@ -245,7 +248,8 @@ impl LayerFS {
 
     /// Copy a file from a lower layer to the upper layer for modification.
     fn copy_up(&self, path: &str) -> VfsResult<VfsPath> {
-        let source = self.resolve(path)?
+        let source = self
+            .resolve(path)?
             .ok_or_else(|| vfs::VfsError::from(VfsErrorKind::FileNotFound))?;
 
         self.ensure_upper_parents(path)?;
@@ -412,8 +416,7 @@ impl vfs::FileSystem for LayerFS {
                         let name = entry.filename();
                         if name.starts_with(WHITEOUT_PREFIX) {
                             if name != OPAQUE_WHITEOUT {
-                                let target =
-                                    name.strip_prefix(WHITEOUT_PREFIX).unwrap_or(&name);
+                                let target = name.strip_prefix(WHITEOUT_PREFIX).unwrap_or(&name);
                                 whiteouts.insert(target.to_string());
                             }
                             continue;
@@ -611,10 +614,7 @@ mod tests {
 
     /// Helper to collect readdir entries as filenames.
     fn readdir_names(path: &VfsPath) -> Vec<String> {
-        path.read_dir()
-            .unwrap()
-            .map(|e| e.filename())
-            .collect()
+        path.read_dir().unwrap().map(|e| e.filename()).collect()
     }
 
     // ── Basic resolution ──────────────────────────────────────────

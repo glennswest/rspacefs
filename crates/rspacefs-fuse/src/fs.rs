@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    consts, BackingId, FileAttr, FileType, Filesystem, KernelConfig, PollHandle,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    consts, BackingId, FileAttr, FileType, Filesystem, KernelConfig, PollHandle, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll,
+    ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY};
 use vfs::{VfsFileType, VfsPath};
@@ -322,7 +322,9 @@ impl RspacefsFuse {
             return Ok(upper_path);
         }
         let source = self.physical_for(path).ok_or(ENOENT)?;
-        let source_meta = source.symlink_metadata().map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        let source_meta = source
+            .symlink_metadata()
+            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
 
         // Ensure parent dirs in upper.
         if let Some(parent_dir) = upper_path.parent() {
@@ -333,7 +335,8 @@ impl RspacefsFuse {
         // byte copy. For symlinks, recreate the link. Both preserve content; the
         // helper below handles xattrs + mode after the fact.
         if source_meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&source).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+            let target =
+                std::fs::read_link(&source).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
             std::os::unix::fs::symlink(&target, &upper_path)
                 .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         } else if source_meta.file_type().is_dir() {
@@ -378,11 +381,7 @@ impl RspacefsFuse {
 impl Filesystem for RspacefsFuse {
     // ── Init handshake ──────────────────────────────────────────────────────
 
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        config: &mut KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         // Advertise passthrough capability to the kernel. If the running
         // kernel is < 6.9 (no passthrough support) this returns Err; we
         // ignore it and continue with daemon-mediated reads.
@@ -402,10 +401,10 @@ impl Filesystem for RspacefsFuse {
         // for readahead and the in-flight request window. Each of these
         // is a Result we silently ignore on error — they're hints, not
         // requirements.
-        let _ = config.set_max_write(1 << 20);          // 1 MB
-        let _ = config.set_max_readahead(1 << 20);      // 1 MB readahead
-        let _ = config.set_max_background(64);          // concurrent requests
-        let _ = config.set_congestion_threshold(48);    // backpressure floor
+        let _ = config.set_max_write(1 << 20); // 1 MB
+        let _ = config.set_max_readahead(1 << 20); // 1 MB readahead
+        let _ = config.set_max_background(64); // concurrent requests
+        let _ = config.set_congestion_threshold(48); // backpressure floor
 
         Ok(())
     }
@@ -434,13 +433,7 @@ impl Filesystem for RspacefsFuse {
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn getattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: Option<u64>,
-        reply: ReplyAttr,
-    ) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         self.stats.record(Op::Getattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -518,8 +511,7 @@ impl Filesystem for RspacefsFuse {
         };
 
         // Synthesize ".", ".." plus the directory contents.
-        let mut all: Vec<(u64, FileType, String)> =
-            Vec::with_capacity(entries.len() + 2);
+        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
         all.push((ino, FileType::Directory, ".".to_string()));
         // ".." inode: cheap approximation — root's parent is root.
         let parent_ino = if ino == ROOT_INO {
@@ -541,7 +533,10 @@ impl Filesystem for RspacefsFuse {
             };
             // Determine the entry kind via physical symlink_metadata so symlinks
             // show as symlinks (not as their targets).
-            let kind = match self.physical_for(&child_path).and_then(|p| p.symlink_metadata().ok()) {
+            let kind = match self
+                .physical_for(&child_path)
+                .and_then(|p| p.symlink_metadata().ok())
+            {
                 Some(m) if m.file_type().is_dir() => FileType::Directory,
                 Some(m) if m.file_type().is_symlink() => FileType::Symlink,
                 Some(_) => FileType::RegularFile,
@@ -685,7 +680,9 @@ impl Filesystem for RspacefsFuse {
                 let existing = cache.get(&ino).and_then(|w| w.upgrade());
                 if let Some(backing) = existing {
                     drop(cache);
-                    self.stats.backing_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .backing_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
                     self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
                     self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                     reply.opened_passthrough(fh, 0, &backing);
@@ -694,7 +691,9 @@ impl Filesystem for RspacefsFuse {
                     return;
                 }
                 // Cache miss — try to open + register a fresh backing.
-                self.stats.backing_cache_misses.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .backing_cache_misses
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Ok(backing_file) = std::fs::File::open(&phys) {
                     match reply.open_backing(&backing_file) {
                         Ok(backing) => {
@@ -815,7 +814,12 @@ impl Filesystem for RspacefsFuse {
                 self.stats.record(Op::Write, ino, 0, libc::EACCES);
                 reply.error(libc::EACCES)
             }
-            OpenFile::Buffered { data: buf, dirty, writable, .. } => {
+            OpenFile::Buffered {
+                data: buf,
+                dirty,
+                writable,
+                ..
+            } => {
                 if !*writable {
                     self.stats.record(Op::Write, ino, 0, libc::EACCES);
                     return reply.error(libc::EACCES);
@@ -852,7 +856,9 @@ impl Filesystem for RspacefsFuse {
             // Drop on BackingId fires BACKING_CLOSE in the kernel.
             OpenFile::Passthrough { .. } => reply.ok(),
             OpenFile::Streaming { .. } => reply.ok(),
-            OpenFile::Buffered { path, data, dirty, .. } => {
+            OpenFile::Buffered {
+                path, data, dirty, ..
+            } => {
                 if dirty {
                     let p = match self.root.join(&path) {
                         Ok(v) => v,
@@ -1109,13 +1115,7 @@ impl Filesystem for RspacefsFuse {
         }
     }
 
-    fn listxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        size: u32,
-        reply: fuser::ReplyXattr,
-    ) {
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
         self.stats.record(Op::Listxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1171,13 +1171,7 @@ impl Filesystem for RspacefsFuse {
         }
     }
 
-    fn removexattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        reply: ReplyEmpty,
-    ) {
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         self.stats.record(Op::Removexattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1220,14 +1214,7 @@ impl Filesystem for RspacefsFuse {
 
     // ── Durable writes ──────────────────────────────────────────────────────
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         self.stats.record(Op::Fsync, ino, 0, 0);
         // For Buffered (writable) handles: flush in-memory dirty data to
         // the upper file now. Streaming (read-only) handles have nothing
@@ -1238,7 +1225,9 @@ impl Filesystem for RspacefsFuse {
         match file {
             OpenFile::Passthrough { .. } => reply.ok(),
             OpenFile::Streaming { .. } => reply.ok(),
-            OpenFile::Buffered { path, data, dirty, .. } => {
+            OpenFile::Buffered {
+                path, data, dirty, ..
+            } => {
                 if !*dirty {
                     return reply.ok();
                 }

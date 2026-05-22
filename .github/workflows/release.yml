@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # to upload assets to the release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: install cross linker for aarch64
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+      - name: build release binaries
+        run: |
+          cargo build --release \
+            --target ${{ matrix.arch }}-unknown-linux-gnu \
+            -p rspacefs-fuse -p rspacefs-cli
+      - name: package
+        id: pkg
+        run: |
+          mkdir -p dist
+          out="rspacefs-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux"
+          mkdir "$out"
+          cp target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs-mount "$out/"
+          cp target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs       "$out/"
+          cp LICENSE README.md "$out/"
+          tar -C . -czf "dist/${out}.tar.gz" "$out"
+          (cd dist && sha256sum "${out}.tar.gz" > "${out}.tar.gz.sha256")
+          echo "tarball=dist/${out}.tar.gz" >>"$GITHUB_OUTPUT"
+          echo "shafile=dist/${out}.tar.gz.sha256" >>"$GITHUB_OUTPUT"
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.shafile }}
+          generate_release_notes: true

@@ -123,7 +123,13 @@ mod linux_main {
                     &mut allow_root,
                 )?;
             } else if let Some(rest) = s.strip_prefix("-o") {
-                parse_overlay_options(rest, &mut upper, &mut lowers, &mut allow_other, &mut allow_root)?;
+                parse_overlay_options(
+                    rest,
+                    &mut upper,
+                    &mut lowers,
+                    &mut allow_other,
+                    &mut allow_root,
+                )?;
             } else if s == "-f" || s == "-d" || s == "-s" {
                 // foreground / debug / single-threaded — accept and ignore;
                 // we already run foreground & single-threaded enough for our
@@ -184,7 +190,8 @@ mod linux_main {
         );
 
         let overlay = LayerFS::new(upper_vfs, lower_vfs);
-        let fs = crate::fs::RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
+        let fs =
+            crate::fs::RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName("rspacefs".to_string()),
@@ -318,7 +325,12 @@ mod linux_main {
             } else if tok == "volatile" {
                 // No-op for now. (overlay 'volatile' = skip fsync; we don't
                 // currently exploit it but accept silently.)
-            } else if tok == "nodev" || tok == "noexec" || tok == "nosuid" || tok == "ro" || tok == "rw" {
+            } else if tok == "nodev"
+                || tok == "noexec"
+                || tok == "nosuid"
+                || tok == "ro"
+                || tok == "rw"
+            {
                 // VFS / kernel mount flags — set by the runtime, applied by
                 // FUSE itself or `mount(8)`. Accept silently.
             } else if tok.starts_with("metacopy=")
@@ -342,8 +354,8 @@ mod linux_main {
             manifest: PathBuf,
             tree: PathBuf,
         }
-        let parsed: std::collections::HashMap<String, V> = serde_json::from_str(s)
-            .context("RSPACEFS_VERITY_LOWERS env var must be JSON")?;
+        let parsed: std::collections::HashMap<String, V> =
+            serde_json::from_str(s).context("RSPACEFS_VERITY_LOWERS env var must be JSON")?;
         Ok(parsed
             .into_iter()
             .map(|(k, v)| (PathBuf::from(k), (v.manifest, v.tree)))
@@ -503,13 +515,8 @@ mod linux_main {
         let mut verified_layers: Vec<bool> = vec![false]; // upper is writable, not verified
         for p in &cli.lower_verified_pinned {
             let path = VfsPath::new(PhysicalFS::new(p.dir.clone()));
-            let verified = VerifiedFS::load_pinned(
-                path,
-                &p.manifest,
-                &p.tree,
-                OnFailure::Reject,
-            )
-            .context(format!(
+            let verified = VerifiedFS::load_pinned(path, &p.manifest, &p.tree, OnFailure::Reject)
+                .context(format!(
                 "loading pinned verity manifest for {} (manifest={}, tree={})",
                 p.dir.display(),
                 p.manifest.display(),
@@ -521,9 +528,8 @@ mod linux_main {
         }
         for l in &cli.lower_verified {
             let path = VfsPath::new(PhysicalFS::new(l.clone()));
-            let verified = VerifiedFS::build(path, OnFailure::Reject).context(
-                format!("building verity manifest for {}", l.display()),
-            )?;
+            let verified = VerifiedFS::build(path, OnFailure::Reject)
+                .context(format!("building verity manifest for {}", l.display()))?;
             lowers.push(verified.into());
             physical_layers.push(l.clone());
             verified_layers.push(true);

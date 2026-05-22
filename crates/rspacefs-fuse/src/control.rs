@@ -197,11 +197,7 @@ fn status_payload(state: &ControlState) -> StatusData {
         mountpoint: state.mountpoint.display().to_string(),
         upper: state.upper.display().to_string(),
         lowers,
-        uptime_secs: state
-            .mount_time
-            .elapsed()
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        uptime_secs: state.mount_time.elapsed().map(|d| d.as_secs()).unwrap_or(0),
         version: env!("CARGO_PKG_VERSION"),
         fuse_passthrough: true,
     }

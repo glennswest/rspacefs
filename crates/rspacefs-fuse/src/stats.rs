@@ -91,13 +91,29 @@ pub struct OpCounters {
 impl OpCounters {
     fn new() -> Self {
         Self {
-            lookup: 0.into(), getattr: 0.into(), setattr: 0.into(),
-            readdir: 0.into(), mkdir: 0.into(), rmdir: 0.into(),
-            open: 0.into(), read: 0.into(), write: 0.into(), release: 0.into(),
-            create: 0.into(), unlink: 0.into(), rename: 0.into(),
-            readlink: 0.into(), symlink: 0.into(),
-            getxattr: 0.into(), listxattr: 0.into(), setxattr: 0.into(), removexattr: 0.into(),
-            fsync: 0.into(), flush: 0.into(), statfs: 0.into(), poll: 0.into(),
+            lookup: 0.into(),
+            getattr: 0.into(),
+            setattr: 0.into(),
+            readdir: 0.into(),
+            mkdir: 0.into(),
+            rmdir: 0.into(),
+            open: 0.into(),
+            read: 0.into(),
+            write: 0.into(),
+            release: 0.into(),
+            create: 0.into(),
+            unlink: 0.into(),
+            rename: 0.into(),
+            readlink: 0.into(),
+            symlink: 0.into(),
+            getxattr: 0.into(),
+            listxattr: 0.into(),
+            setxattr: 0.into(),
+            removexattr: 0.into(),
+            fsync: 0.into(),
+            flush: 0.into(),
+            statfs: 0.into(),
+            poll: 0.into(),
         }
     }
 }
@@ -134,21 +150,37 @@ impl Stats {
         ctr.fetch_add(1, Ordering::Relaxed);
         self.last_op_unix_ms.store(now_ms(), Ordering::Relaxed);
         match op {
-            Op::Read => { self.bytes_read.fetch_add(bytes, Ordering::Relaxed); }
-            Op::Write => { self.bytes_written.fetch_add(bytes, Ordering::Relaxed); }
+            Op::Read => {
+                self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Op::Write => {
+                self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+            }
             _ => {}
         }
         if rc != 0 {
             match rc {
-                libc::ENOENT => { self.errors_enoent.fetch_add(1, Ordering::Relaxed); }
-                libc::EIO => { self.errors_io.fetch_add(1, Ordering::Relaxed); }
-                _ => { self.errors_other.fetch_add(1, Ordering::Relaxed); }
+                libc::ENOENT => {
+                    self.errors_enoent.fetch_add(1, Ordering::Relaxed);
+                }
+                libc::EIO => {
+                    self.errors_io.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    self.errors_other.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // Lock contention here is fine — recent ring is for human-debug
         // and is only sampled at scrape time.
         if let Ok(mut r) = self.recent.lock() {
-            r.push(RecentOp { ts_ms: now_ms(), op, ino, bytes, rc });
+            r.push(RecentOp {
+                ts_ms: now_ms(),
+                op,
+                ino,
+                bytes,
+                rc,
+            });
         }
     }
 
@@ -238,10 +270,29 @@ impl Stats {
 #[derive(Copy, Clone, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Op {
-    Lookup, Getattr, Setattr, Readdir, Mkdir, Rmdir,
-    Open, Read, Write, Release, Create, Unlink, Rename,
-    Readlink, Symlink, Getxattr, Listxattr, Setxattr, Removexattr,
-    Fsync, Flush, Statfs, Poll,
+    Lookup,
+    Getattr,
+    Setattr,
+    Readdir,
+    Mkdir,
+    Rmdir,
+    Open,
+    Read,
+    Write,
+    Release,
+    Create,
+    Unlink,
+    Rename,
+    Readlink,
+    Symlink,
+    Getxattr,
+    Listxattr,
+    Setxattr,
+    Removexattr,
+    Fsync,
+    Flush,
+    Statfs,
+    Poll,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -368,11 +419,18 @@ pub fn render_prom(snap: &StatsSnapshot, mountpoint: &str) -> String {
     }
     macro_rules! op_ctr {
         ($name:literal, $val:expr) => {{
-            out.push_str(&format!("rspacefs_ops_total{{mount=\"{}\",op=\"{}\"}} {}\n", m, $name, $val));
+            out.push_str(&format!(
+                "rspacefs_ops_total{{mount=\"{}\",op=\"{}\"}} {}\n",
+                m, $name, $val
+            ));
         }};
     }
 
-    gauge!("rspacefs_uptime_seconds", snap.uptime_secs, "seconds since rspacefs-mount started");
+    gauge!(
+        "rspacefs_uptime_seconds",
+        snap.uptime_secs,
+        "seconds since rspacefs-mount started"
+    );
     out.push_str("# HELP rspacefs_ops_total FUSE op invocations by op name\n");
     out.push_str("# TYPE rspacefs_ops_total counter\n");
     op_ctr!("lookup", snap.ops.lookup);
@@ -399,22 +457,86 @@ pub fn render_prom(snap: &StatsSnapshot, mountpoint: &str) -> String {
     op_ctr!("statfs", snap.ops.statfs);
     op_ctr!("poll", snap.ops.poll);
 
-    counter!("rspacefs_bytes_read_total", snap.bytes_read, "bytes returned to clients via read()");
-    counter!("rspacefs_bytes_written_total", snap.bytes_written, "bytes accepted from clients via write()");
-    counter!("rspacefs_passthrough_opens_total", snap.passthrough_opens, "opens served via FUSE_PASSTHROUGH (kernel-direct)");
-    counter!("rspacefs_streaming_opens_total", snap.streaming_opens, "opens served via daemon streaming (verified or fallback)");
-    counter!("rspacefs_buffered_opens_total", snap.buffered_opens, "opens served via in-memory read-modify-write buffer (writable opens)");
-    counter!("rspacefs_copy_ups_total", snap.copy_ups, "copy-ups from a lower layer into upper");
-    counter!("rspacefs_copy_up_bytes_total", snap.copy_up_bytes, "bytes copied during copy-up");
-    counter!("rspacefs_reflinks_ok_total", snap.reflinks_ok, "copy-ups that took the FICLONE reflink fast path");
-    counter!("rspacefs_reflinks_fallback_total", snap.reflinks_fallback, "copy-ups that fell back to a byte copy");
-    counter!("rspacefs_backing_cache_hits_total", snap.backing_cache_hits, "BackingId cache reuse");
-    counter!("rspacefs_backing_cache_misses_total", snap.backing_cache_misses, "BackingId cache miss (BACKING_OPEN ioctl issued)");
-    counter!("rspacefs_errors_total{kind=\"io\"}", snap.errors_io, "EIO returned to client");
-    counter!("rspacefs_errors_total{kind=\"enoent\"}", snap.errors_enoent, "ENOENT returned to client");
-    counter!("rspacefs_errors_total{kind=\"other\"}", snap.errors_other, "other errno returned to client");
-    gauge!("rspacefs_open_handles", snap.open_handles, "current file handles in the open table");
-    gauge!("rspacefs_last_op_unix_ms", snap.last_op_unix_ms, "epoch-ms timestamp of the last op (liveness)");
+    counter!(
+        "rspacefs_bytes_read_total",
+        snap.bytes_read,
+        "bytes returned to clients via read()"
+    );
+    counter!(
+        "rspacefs_bytes_written_total",
+        snap.bytes_written,
+        "bytes accepted from clients via write()"
+    );
+    counter!(
+        "rspacefs_passthrough_opens_total",
+        snap.passthrough_opens,
+        "opens served via FUSE_PASSTHROUGH (kernel-direct)"
+    );
+    counter!(
+        "rspacefs_streaming_opens_total",
+        snap.streaming_opens,
+        "opens served via daemon streaming (verified or fallback)"
+    );
+    counter!(
+        "rspacefs_buffered_opens_total",
+        snap.buffered_opens,
+        "opens served via in-memory read-modify-write buffer (writable opens)"
+    );
+    counter!(
+        "rspacefs_copy_ups_total",
+        snap.copy_ups,
+        "copy-ups from a lower layer into upper"
+    );
+    counter!(
+        "rspacefs_copy_up_bytes_total",
+        snap.copy_up_bytes,
+        "bytes copied during copy-up"
+    );
+    counter!(
+        "rspacefs_reflinks_ok_total",
+        snap.reflinks_ok,
+        "copy-ups that took the FICLONE reflink fast path"
+    );
+    counter!(
+        "rspacefs_reflinks_fallback_total",
+        snap.reflinks_fallback,
+        "copy-ups that fell back to a byte copy"
+    );
+    counter!(
+        "rspacefs_backing_cache_hits_total",
+        snap.backing_cache_hits,
+        "BackingId cache reuse"
+    );
+    counter!(
+        "rspacefs_backing_cache_misses_total",
+        snap.backing_cache_misses,
+        "BackingId cache miss (BACKING_OPEN ioctl issued)"
+    );
+    counter!(
+        "rspacefs_errors_total{kind=\"io\"}",
+        snap.errors_io,
+        "EIO returned to client"
+    );
+    counter!(
+        "rspacefs_errors_total{kind=\"enoent\"}",
+        snap.errors_enoent,
+        "ENOENT returned to client"
+    );
+    counter!(
+        "rspacefs_errors_total{kind=\"other\"}",
+        snap.errors_other,
+        "other errno returned to client"
+    );
+    gauge!(
+        "rspacefs_open_handles",
+        snap.open_handles,
+        "current file handles in the open table"
+    );
+    gauge!(
+        "rspacefs_last_op_unix_ms",
+        snap.last_op_unix_ms,
+        "epoch-ms timestamp of the last op (liveness)"
+    );
     out
 }
 

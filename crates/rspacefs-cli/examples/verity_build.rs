@@ -52,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OnFailure::Reject,
     );
     let (checked, failed) = verified.full_check()?;
-    println!("full_check  : {} blocks checked, {} failed", checked, failed);
+    println!(
+        "full_check  : {} blocks checked, {} failed",
+        checked, failed
+    );
 
     println!("\n=== mutate a block and re-verify ===");
     {
@@ -61,7 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Read the bytes back the way a consumer would.
     let mut buf = Vec::new();
-    root.join("etc/release")?.open_file()?.read_to_end(&mut buf)?;
+    root.join("etc/release")?
+        .open_file()?
+        .read_to_end(&mut buf)?;
     // Verifying the (now-tampered) bytes against the original tree:
     match verified.verify_file_blocks("etc/release", &buf, 0) {
         Ok(_) => println!("verify_file_blocks: OK (BUG — should have failed!)"),
