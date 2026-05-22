@@ -14,7 +14,7 @@ authors = ["Glenn West"]
 license = "MIT"
 repository = "https://github.com/glennswest/rspacefs"
 rust-version = "1.75"
-description = "Pure-Rust userspace LayerFS and dm-verity. No NFS, no kernel, no async — direct file I/O via the vfs trait."
+description = "Pure-Rust userspace LayerFS and dm-verity for container image rootfs. Mounts via FUSE; integrates with containers-storage as mount_program."
 
 # Release-profile tuning. The mount daemon is hot — every container start
 # on every cluster node exercises it. Squeeze fixed-overhead out at compile

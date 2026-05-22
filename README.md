@@ -167,16 +167,6 @@ deployments pending. API surface stable; semantic versioning applies.
 Active issues at
 [github.com/glennswest/rspacefs/issues](https://github.com/glennswest/rspacefs/issues).
 
-## Secondary use case: NFS-served rootfs for unprivileged container runtimes
-
-If you have a container runtime that **cannot run FUSE in the container**
-(e.g., RouterOS, locked-down embedded), the same rspacefs engine can be
-hosted in a daemon that exports the merged tree over NFSv4. That uses
-[`nextnfs`](https://github.com/glennswest/nextnfs) with its
-`add_rspacefs_export` API, and the container mounts via
-`root-dir=nfs://...`. This is not the product's primary deployment but
-is supported because the engine itself is consumer-agnostic.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).

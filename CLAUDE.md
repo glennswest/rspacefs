@@ -1,14 +1,14 @@
 # CLAUDE.md — rspacefs Project
 
-Pure-Rust userspace LayerFS + dm-verity. Extracted from nextnfs on
-2026-05-19 so callers can use the layered-rootfs primitives without any
-NFS / network / kernel-module dependency.
+Pure-Rust userspace LayerFS + dm-verity for container image rootfs.
+Mounts via FUSE; plugs into containers-storage as `mount_program` so
+CRI-O / podman delegate every image mount to rspacefs.
 
 ## Build & Test
 
 ```bash
-cargo build --workspace --release    # build all three crates
-cargo test  --workspace              # run all tests (overlay, verity, cross)
+cargo build --workspace --release    # build all four crates
+cargo test  --workspace              # run all tests
 cargo install --path crates/rspacefs-cli   # install the `rspacefs` CLI
 
 make build       # same as cargo build --workspace --release
@@ -18,17 +18,16 @@ make fmt         # cargo fmt --all
 make clippy      # cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The whole workspace is `no_std`-friendly in spirit (no async, no tokio, no
-networking) but does use `std` for file I/O via the `vfs` crate.
+Synchronous file I/O via the `vfs` trait. No async, no tokio.
 
 ## Architecture
 
-| Crate              | Path                       | Lines | Purpose                                                                 |
-|--------------------|----------------------------|-------|-------------------------------------------------------------------------|
-| `rspacefs-core`    | `crates/rspacefs-core/`    | ~1030 | LayerFS impl: upper + N lower layers, OCI whiteouts, copy-up.         |
-| `rspacefs-verity`  | `crates/rspacefs-verity/`  | ~1390 | SHA-256 Merkle tree, layer manifest, verified-block cache, verified FS. |
-| `rspacefs-cli`     | `crates/rspacefs-cli/`     | ~250  | `rspacefs` binary: `overlay {ls,cat,stat}`, `verity {build,verify,inspect}`. |
-| `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | ~500  | `rspacefs-mount` Linux daemon: real FUSE mount of a LayerFS, with optional verified lowers. Stub binary on non-Linux. |
+| Crate              | Path                       | Purpose                                                                 |
+|--------------------|----------------------------|-------------------------------------------------------------------------|
+| `rspacefs-core`    | `crates/rspacefs-core/`    | LayerFS impl: upper + N lower layers, OCI whiteouts, copy-up. Whiteout cache makes 150+ layer stacks O(1) after warmup. |
+| `rspacefs-verity`  | `crates/rspacefs-verity/`  | SHA-256 Merkle tree, layer manifest, verified-block cache, streaming `VerifiedReader`. Tamper detection at block granularity. |
+| `rspacefs-cli`     | `crates/rspacefs-cli/`     | `rspacefs` binary: `overlay {ls,cat,stat}`, `verity {build,verify,inspect}`, `ctl {ping,status,invalidate,stats,info,ops}`. |
+| `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | `rspacefs-mount` Linux daemon: real FUSE mount, mount_program-compatible argv, self-daemonizing fork, FUSE_PASSTHROUGH on kernel ≥ 6.9. |
 
 Both library crates implement `vfs::FileSystem` and compose freely — a
 verified read-only layer can be a lower layer of an overlay, an overlay
@@ -36,30 +35,26 @@ can be a lower layer of another overlay, etc.
 
 ### Dependencies
 
-`rspacefs-core` — only `vfs`.
-`rspacefs-verity` — `vfs`, `sha2`, `serde`, `serde_json`, `tracing`.
-`rspacefs-cli` — both library crates plus `clap`, `anyhow`.
-`rspacefs-fuse` — both library crates plus `fuser`, `libc`, `clap`, `anyhow`,
-`tracing-subscriber`. `fuser` and `libc` are gated by
-`cfg(target_os = "linux")`; on macOS the workspace still builds and
-produces a stub binary that errors at runtime.
-
-The verity crate's tests also dev-depend on `rspacefs-core` for the
-"verified layer beneath overlay" cross-test, which proves the two crates
-compose correctly.
+- `rspacefs-core` — only `vfs`.
+- `rspacefs-verity` — `vfs`, `sha2`, `serde`, `serde_json`, `tracing`.
+- `rspacefs-cli` — both library crates plus `clap`, `anyhow`.
+- `rspacefs-fuse` — both library crates plus `fuser` (0.16 with `abi-7-40`
+  for FUSE_PASSTHROUGH), `libc`, `xattr`, `clap`, `anyhow`,
+  `tracing-subscriber`. `fuser` and `libc` are gated by
+  `cfg(target_os = "linux")`; on macOS the workspace still builds and
+  produces a stub binary that errors at runtime.
 
 ### Building rspacefs-fuse
 
-`fuser` 0.15 has a build-script that panics when host OS is non-Linux
+`fuser` 0.15+ has a build-script that panics when host OS is non-Linux
 (uses `cfg!(target_os)` in build.rs against host, not target). That means:
 
 - **macOS** — `cargo build --workspace` works; the fuse crate compiles a stub.
   Cross-compiling to Linux from a Mac fails inside fuser's build.rs.
 - **Linux host** — `cargo build --workspace` builds everything including
-  the real FUSE mount binary. Default `fuser` features = `["libfuse"]`,
-  but we disable defaults at the workspace level (`default-features = false`),
-  so fuser uses its pure-Rust mount path on Linux. No system libfuse needed
-  at build time; only `/dev/fuse` access at runtime.
+  the real FUSE mount binary. We disable `fuser`'s defaults at the
+  workspace level so it uses its pure-Rust mount path. No system libfuse
+  needed at build time; only `/dev/fuse` access at runtime.
 
 To build the FUSE binary, copy/clone the repo onto a Linux host (e.g.,
 `test1.g8.lo`) and run:
@@ -69,54 +64,49 @@ cargo build --release -p rspacefs-fuse
 # → target/release/rspacefs-mount
 ```
 
-## Cross-project relationship
-
-rspacefs sits beneath two different consumer paths with intentionally
-different transports — pick the right one per environment, don't conflate:
+## How rspacefs fits into a container runtime
 
 ```
-                         rspacefs-core (LayerFS) + rspacefs-verity
+   ┌────────────────────────────────────────────────────────┐
+   │  podman / CRI-O                                        │
+   │  (containers-storage with mount_program = rspacefs)    │
+   └──────────────────────────┬─────────────────────────────┘
+                              │ argv: -o lowerdir=L1:L2,upperdir=U,workdir=W /merged
+                              ▼
+                       rspacefs-mount    (Linux FUSE daemon)
                               │
-              ┌───────────────┼───────────────────────────────┐
-              │               │                               │
-       rspacefs-fuse   nextnfs (+ rspacefs-core dep)   rspacefs-registry
-       (Linux FUSE,    NFSv4 export of a LayerFS,      (extends mkube-registry,
-        end-user)      for environments with no FUSE   ships in mkube)
-              │               │                               │
-              ▼               ▼                               ▼
-       general Linux    MikroTik containers              OpenShift / podman
-       dev/test         (root-dir = nfs://...)            (standard OCI pull
-                                                          → kernel overlayfs)
+                              ▼
+         LayerFS (upper + N lowers, whiteouts, copy-up)
+                              │
+                              ▼
+              VerifiedFS (per-layer block hashing)
+                              │
+                              ▼
+                  `vfs::FileSystem` impls
+                              │
+                              ▼
+                 Real filesystem (PhysicalFS)
 ```
 
-### MikroTik path (NFS)
-nextnfs depends on `rspacefs-core` and gains an export type:
-`add_rspacefs_export(name, upper, lowers)`. RouterOS containers are created
-with `root-dir=nfs://nfs-host/<export>` — no tarball extract, live overlay,
-copy-up to per-container upper. Cross-project glue: nextnfs gets the new
-export API, mkube switches container creation off `file=tarball` and onto
-`root-dir=nfs`. The container backend (RouterOS) already supports NFS-backed
-root-dirs.
+CRI-O extracts each image layer tarball into a directory under
+`/var/lib/containers/storage/overlay/l/<id>`. When a container starts,
+containers-storage invokes `mount_program` with the upper/lower/workdir
+arguments and a mountpoint. rspacefs-mount answers by FUSE-mounting a
+LayerFS-backed merged view at that mountpoint, then the container
+runtime `pivot_root`s the container into it.
 
-### OpenShift path (registry only — no NFS in data path)
-`mkube-registry` gains an rspacefs storage backend:
-- Eager extraction on layer push: blob + extracted directory tree.
-- `POST /v1/commit` snapshots a running container's upper into a new layer
-  by renaming the upper-dir into the layer pool (no tar).
-- Optional `zstd:chunked` / eStargz output for partial-pull-aware clients.
-- Optional fs-verity descriptors attached to manifests so CRI-O can hand
-  them to the kernel via `FS_IOC_ENABLE_VERITY`.
-- Standard OCI distribution v2 on the wire; CRI-O / podman see a normal
-  registry, just faster.
+## Sibling projects
 
-NFS does **not** appear in the OpenShift path. The kernel does overlayfs as
-usual; rspacefs-registry just delivers layers to the existing container-
-storage path more efficiently.
+- `../rspace_registry/` — Rust OCI Distribution registry head. Sibling
+  Cargo workspace. Long-term: shares the same containers-storage
+  substrate rspacefs reads, so push lands bytes once and pull serves
+  them with zero copy. Integration spec in `enhancements/rspacefs-registry-head.md`.
 
-### Library use
-If a project wants to use rspacefs directly without NFS or FUSE, add
-`rspacefs-core` (and optionally `rspacefs-verity`) as a Cargo dependency.
-No NFS server, no binary, no daemon — it's a library.
+## Targets
+
+- **OpenShift / Kubernetes / podman on Linux.** Primary target.
+  Plugs into containers-storage via `mount_program`. No CRD, no
+  controller; one binary on the node + a `storage.conf` line.
 
 ## Work Plan
 
@@ -124,81 +114,108 @@ No NFS server, no binary, no daemon — it's a library.
 
 ### TODO (priority order)
 
-1. **Symlink support in `rspacefs-fuse`** — `readlink`/`symlink` FUSE ops
-   plus a side-channel to `std::os::unix::fs` (vfs trait has no symlink
-   methods). Required for any real container image; `/sbin → /usr/sbin`
-   and the like break without it.
-2. **Pinned verity manifest load** — `--manifest base.manifest.json` on
-   `rspacefs-mount` and `LayerFS` callers; load the prebuilt manifest from
-   disk instead of rebuilding from current content. Without this, tampering
-   between mounts goes undetected.
-3. **nextnfs extension** — add `rspacefs-core` as a dep in nextnfs; new
-   `add_rspacefs_export(name, upper, lowers)` API on `ExportManagerHandle`.
-   Cross-project: spec lands in `nextnfs/enhancements/`. Unblocks MikroTik
-   container `root-dir=nfs://…` flow.
-4. **mkube-registry rspacefs backend** (in mkube): eager extraction on push
-   (blob + extracted dir tree), `POST /v1/commit` for snapshot-container-
-   as-image, optional `zstd:chunked` + eStargz output, optional fs-verity
-   descriptors in manifests. Spec lands in `mkube/enhancements/`.
-5. **Publish to crates.io.** Both library crates + the CLI; FUSE crate
-   separately once tested on a few distros.
-6. **Examples.** `examples/overlay_mount.rs`, `examples/verity_build.rs`,
-   `examples/verified_overlay.rs`.
-7. **Whiteout caching.** Profile `is_whiteout` on directories with many
-   entries; cache the per-directory whiteout set if it shows up.
-8. **Sparse / reflink copy-up.** On filesystems that support it (XFS, btrfs,
-   apfs), use `copy_file_range` or reflinks instead of full content copy.
-9. **`vfs` trait extensions.** xattrs, ownership, capabilities — needed to
-   make this a complete container-rootfs replacement on Linux. Likely
-   requires a fork of the `vfs` crate or adding a sibling
-   `rspacefs-vfs-ext` crate.
-10. **Streaming reads in `rspacefs-fuse`** — current `open()` reads the
-    whole file into the file-handle cache. Replace with a `SeekAndRead`
-    held in the fh table; serve `read(ino, offset, size)` from that.
-11. **FUSE-over-io_uring** — when `fuser` exposes the feature flag, enable
-    it. Expected 2–3× metadata throughput.
-12. **FUSE passthrough** (kernel ≥ 6.9) — for unmodified lower-layer files,
-    register the backing fd as a passthrough target so kernel serves reads
-    directly without bouncing through the daemon. Brings reads to near-
-    native kernel-FS speed.
-6. **Fuzz testing.** Path-traversal, malformed whiteout names, oversized
-   trees. `cargo-fuzz` targets.
-7. **CLI: overlay write.** `rspacefs overlay write --upper ... <path> -`
-   to commit data through the merged view. Useful for scripted layer
-   surgery.
+1. **K8s test cluster up clean on Fedora 42** (reimage of test1.g8.lo
+   in progress). Then run beatup + benchmarks end-to-end and commit
+   the first results under `tests/k8s/runs/`.
+2. **Stats wiring + Prometheus `/metrics` HTTP endpoint** —
+   `crates/rspacefs-fuse/src/stats.rs` exists; `record(...)` calls
+   landed in most ops. Next: add `--metrics-addr` HTTP listener that
+   serves `render_prom()` output, plus a `rspacefs-node-exporter`
+   binary that aggregates per-PID sockets into one node-level
+   `/metrics`. OpenShift ServiceMonitor manifest in
+   `docs/openshift-metrics.md`.
+3. **pprof `/debug/pprof/*` endpoint** alongside `/metrics` via
+   `pprof-rs` (Go-compatible profile format → `go tool pprof`).
+4. **Deep-layer test containers** — `tests/k8s/workloads/deep-layers/`
+   `build-set.sh` already generates 100/130/150/200-layer OCI images.
+   Run on the live cluster and confirm rspacefs serves layer counts
+   that kernel overlay's default 125-layer mount-stack limit rejects.
+5. **Pluggable store backend (control socket)** — current control
+   surface has `ping`, `status`, `invalidate`. Add `stats`,
+   `metrics-text`, `info`, `ops`, `debug` so a single Unix socket
+   exposes the full operational view.
+6. **Streaming verified reads scale test.** `VerifiedReader` is O(1)
+   memory by design — benchmark a 2 GB verified shared lib through the
+   mount and confirm the daemon RSS stays flat.
+7. **fs-verity descriptor attachment.** Build manifests in a form
+   CRI-O can hand to `FS_IOC_ENABLE_VERITY` for in-kernel verification
+   of post-extract layer contents. Out of scope of the daemon's
+   verification, complementary.
+8. **SELinux policy upstream.** Installer flips SELinux to permissive
+   today; ship a proper policy module so we can stay enforcing.
+9. **Fuzz testing.** Path-traversal, malformed whiteout names,
+   oversized trees. `cargo-fuzz` targets.
+10. **CLI: overlay write.** `rspacefs overlay write --upper ... <path> -`
+    to commit data through the merged view. Useful for scripted layer
+    surgery.
 
 ### In Progress
 
-- [x] (started 2026-05-19) Extract overlay + verity from nextnfs into
-  standalone rspacefs workspace.
+- [ ] (started 2026-05-21) Bring up single-node K8s on test1 with
+  rspacefs as `mount_program`. Blocked on Fedora 42 reimage.
+- [ ] Stats wiring across FUSE ops.
 
 ### Recently Completed
 
-- [x] Initial extraction from nextnfs 0.13.x — `nfs/src/server/overlay.rs`
-  → `rspacefs-core`, `nfs/src/server/verity.rs` → `rspacefs-verity`, plus
-  a fresh CLI in `rspacefs-cli`.
+- [x] (2026-05-21) Self-deadlock fix in `lower_is_opaque_above` — read
+  guard's temporary scope under Rust 2021 edition kept the read lock
+  alive into the write-lock branch. Single-threaded fuser thread
+  deadlocked on its own RwLock. Caught live on a 14-layer apiserver
+  mount during kubeadm bootstrap. Regression test added.
+- [x] (2026-05-21) Production-quality single-node K8s installer
+  (`tests/k8s/single-node-install/`). Idempotent bash scripts that
+  bootstrap upstream Kubernetes + CRI-O 1.32 + rspacefs as
+  mount_program + flannel CNI on a Fedora 42 host.
+- [x] (2026-05-21) Test history + env-capture system. Every install
+  drops a snapshot under `tests/k8s/runs/<id>/` with kernel,
+  packages, rspacefs binary sha256, kubelet/crio versions, configs,
+  and cluster state. `recreate-env.sh` reinstalls a matching env on
+  a fresh host. `HISTORY.md` is auto-appended.
+- [x] (2026-05-21) rspacefs-mount self-daemonizes in mount_program
+  mode — forks, parent polls statfs() for FUSE_SUPER_MAGIC, child
+  detaches via setsid+stdio-to-/dev/null. Containers-storage
+  contract honored without an external shim.
+- [x] (2026-05-19) FUSE_PASSTHROUGH for read-only non-verified opens
+  (kernel ≥ 6.9) — kernel reads backing fd directly, daemon out of
+  the hot path.
+- [x] (2026-05-19) Streaming `VerifiedReader` — 4 KB block at a time,
+  arbitrary `Read`/`Seek`, O(1) memory regardless of file size.
+- [x] (2026-05-19) xattr support, reflink copy-up via FICLONE,
+  symlink support, pinned verity manifest load, file mode/uid/gid
+  preservation via side-channel `stat()` on the physical backing.
+- [x] (2026-05-19) Whiteout cache — per-(layer, parent_dir) HashSet
+  built lazily and Arc-shared. 150+ layer stacks resolve in O(1)
+  after warmup instead of O(N) per lookup.
 
 ## Testing
 
 ```bash
 cargo test --workspace                              # everything
-cargo test -p rspacefs-core                         # overlay only
-cargo test -p rspacefs-verity                       # verity only (incl. cross-test using rspacefs-core)
-cargo test -p rspacefs-cli                          # CLI smoke tests (if added)
+cargo test -p rspacefs-core                         # LayerFS
+cargo test -p rspacefs-verity                       # verity (incl. cross-test using rspacefs-core)
+cargo test -p rspacefs-cli                          # CLI smoke tests
+cargo test -p rspacefs-fuse                         # FUSE-side (Linux only)
 ```
 
-Test inventory at extraction time:
+End-to-end K8s tests under `tests/k8s/`:
 
-- **rspacefs-core**: 24 tests, all `MemoryFS`-based — basic read/write
-  through layers, opaque whiteouts, three-layer stacking, EXDEV-safe move.
-- **rspacefs-verity**: 30+ tests covering tree build / verify / serialize /
-  manifest JSON / verified-block cache / `FileSystem` integration. Includes
-  cross-test wrapping `VerifiedFS` as a lower layer of `LayerFS`.
+```bash
+tests/k8s/single-node-install/install-all.sh       # bootstrap real K8s on Fedora 42
+tests/k8s/workloads/beatup.sh                      # 50 images, ~200 short-lived pods
+tests/k8s/workloads/bench-startup.sh               # container-start latency CSV
+tests/k8s/workloads/deep-layers/build-set.sh 150   # generate a 150-layer test image
+tests/k8s/env-capture/capture-env.sh --purpose ... # snapshot the host
+```
 
 ## File pointers
 
 - Workspace manifest: `Cargo.toml`
-- Overlay source: `crates/rspacefs-core/src/overlay.rs`
-- Verity source: `crates/rspacefs-verity/src/verity.rs`
-- CLI source: `crates/rspacefs-cli/src/main.rs`
-- Original extraction spec: `nextnfs/enhancements/extract-rspacefs.md`
+- LayerFS: `crates/rspacefs-core/src/layer.rs`
+- Verity: `crates/rspacefs-verity/src/verity.rs`
+- CLI: `crates/rspacefs-cli/src/main.rs`
+- FUSE daemon: `crates/rspacefs-fuse/src/main.rs` + `fs.rs` + `control.rs` + `stats.rs`
+- K8s installer: `tests/k8s/single-node-install/`
+- K8s workloads: `tests/k8s/workloads/`
+- Test run history: `tests/k8s/runs/HISTORY.md`
+- Enhancement specs: `enhancements/`
+- OpenShift integration spec: `docs/openshift-integration.md`

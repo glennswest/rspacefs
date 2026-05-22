@@ -143,15 +143,13 @@ Upstream conversation has floated a CRI-O snapshotter interface modeled on conta
 
 ## File locations referenced
 
-- `rspacefs/crates/rspacefs-fuse/src/main.rs` — extend CLI parser
-- `mkube/enhancements/openshift-crio-rspacefs-integration.md` — this spec
-- `mkube/enhancements/nfs-rootdir-containers.md` — the MikroTik counterpart (NFS root-dir)
-- `mkube/enhancements/mkube-boot-from-registry.md` — mkube self-boot pivot
-- `nextnfs/enhancements/rspacefs-export-type.md` — nextnfs side of the MikroTik path
+- `crates/rspacefs-fuse/src/main.rs` — `mount_program` argv parser, daemonize
+- `tests/k8s/single-node-install/` — production-quality single-node kubeadm + CRI-O + rspacefs installer
+- `tests/k8s/workloads/` — beatup, benchmarks, deep-layer test images
+- `enhancements/rspacefs-registry-head.md` — sibling Rust registry head spec
 
 ## Out of scope
 
 - **Faster `podman commit`** — covered separately. Containers-storage doesn't currently support non-tarball commit. Separate problem; would need a buildah/podman extension.
 - **Image distribution changes** — none. Standard OCI v2 stays.
 - **Kubernetes / OpenShift API additions** — none. No CRDs. No custom operators beyond the DaemonSet that drops in storage.conf.
-- **MikroTik / RouterOS** — different integration (NFS root-dir). See `nfs-rootdir-containers.md`.

@@ -440,7 +440,7 @@ impl VerifiedBlockCache {
 /// Action to take when verification fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnFailure {
-    /// Return an I/O error (NFS4ERR_IO). Default, most secure.
+    /// Return an I/O error to the caller. Default, most secure.
     Reject,
     /// Log a warning but serve the data anyway (for debugging/migration).
     Warn,
