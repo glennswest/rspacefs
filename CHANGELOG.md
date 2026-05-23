@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### 2026-05-23
+- **feat (fuse):** Control protocol expanded — `stats` (JSON counter snapshot), `metrics-text` (Prometheus text), `info` (config + pid + version), `ops` (recent FUSE op ring), `debug` (open handles, RSS, last-op, layer count). `ControlState` now carries `Arc<Stats>` so reads don't touch the FS.
+- **feat (cli):** `rspacefs ctl --socket PATH ...` gains `stats`, `metrics`, `info`, `ops [--n N]`, `debug` subcommands. `metrics` strips the JSON envelope so output is valid Prometheus exposition text.
+- **feat (fuse):** `--metrics-addr HOST:PORT` flag on `rspacefs-mount`. Spawns a thin std-only HTTP/1.1 server serving `GET /metrics` (Prometheus text) and `GET /healthz`. No async runtime, no axum/hyper — one thread per scrape on a multi-second cadence, designed to multiply cheaply across many per-mount processes.
+- **docs:** `docs/openshift-metrics.md` — every metric documented, DaemonSet shapes (direct per-process vs. future `rspacefs-node-exporter`), example ServiceMonitor + Service manifests for OpenShift user-workload monitoring.
+
 ### 2026-05-21
 - **feat (tests/k8s):** Production-quality single-node Kubernetes installer at `tests/k8s/single-node-install/`. Idempotent shell scripts (`01-prereqs` through `06-validate` + `install-all` orchestrator) that bootstrap a real upstream Kubernetes cluster on a Fedora host with CRI-O 1.32 as the runtime and `rspacefs-mount` wired in as the containers-storage `mount_program` from day zero. Cilium (eBPF, kube-proxy-replacement) as the CNI. This is the foundation that the SNO installer patch will reuse — same `storage.conf` shape, same `mount_program` path, same kubelet/CRI-O versions. Includes `uninstall.sh` for clean teardown and `build-bin.sh` for cross-compiling rspacefs-mount + rspacefs (cli) for the target arch.
 - **feat (tests/k8s):** Beatup + benchmark + deep-layer workloads under `tests/k8s/workloads/`. `beatup.sh` pulls 50 representative images and runs ~200 short-lived pods (50 sequential + 100 parallel storm) with rspacefs-mount RSS sampling. `bench-startup.sh` measures cold/warm container-start latency for a representative image set. `deep-layers/build-set.sh` assembles OCI images with 100/130/150/200 layers via buildah — the 130+ sets break kernel overlayfs's default 125-layer mount-stack limit, so they're the unambiguous "this only runs because of rspacefs" demo. `run-deep.sh` drives each set through CRI-O on the test node.

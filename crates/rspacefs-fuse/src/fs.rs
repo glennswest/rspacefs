@@ -178,9 +178,6 @@ impl RspacefsFuse {
     /// Public accessor for callers (the control thread) that need a
     /// reference to the shared `Stats` after the FS has been moved into
     /// the FUSE session.
-    // dead_code allow goes away when control.rs grows Request::Stats /
-    // Request::MetricsText / Request::Ops arms (task #8).
-    #[allow(dead_code)]
     pub fn stats(&self) -> Arc<Stats> {
         Arc::clone(&self.stats)
     }

@@ -16,6 +16,8 @@ mod control;
 #[cfg(target_os = "linux")]
 mod fs;
 #[cfg(target_os = "linux")]
+mod metrics;
+#[cfg(target_os = "linux")]
 mod stats;
 
 #[cfg(target_os = "linux")]
@@ -449,6 +451,16 @@ mod linux_main {
         #[arg(long, value_name = "PATH")]
         control_socket: Option<PathBuf>,
 
+        /// Optional `host:port` to expose Prometheus metrics over HTTP.
+        /// When set, rspacefs-mount serves `GET /metrics` (Prometheus
+        /// text-exposition format) and `GET /healthz` (200 OK) on that
+        /// address. One open port per mount process. The node-exporter
+        /// aggregator scrapes per-PID instances and re-exposes one
+        /// node-level /metrics. OpenShift ServiceMonitor / PodMonitor
+        /// compatible.
+        #[arg(long, value_name = "HOST:PORT")]
+        metrics_addr: Option<String>,
+
         /// Pre-squash lower layers into a single read-only tree at mount
         /// time using hardlinks (or reflinks where supported). Reduces the
         /// per-resolve fan-out from N lowers to 1, at the cost of a
@@ -593,6 +605,23 @@ mod linux_main {
             opts.push(MountOption::AutoUnmount);
         }
 
+        // Pull stats out BEFORE moving `fs` into the FUSE session — we
+        // need the Arc<Stats> handle alive in the metrics + control
+        // threads independently of the session.
+        let stats = fs.stats();
+        let mountpoint_str = cli.mountpoint.display().to_string();
+
+        // Metrics HTTP server is independent of the control socket.
+        // Either, both, or neither may be enabled.
+        if let Some(addr) = &cli.metrics_addr {
+            let _h = crate::metrics::spawn_metrics_server(
+                addr,
+                std::sync::Arc::clone(&stats),
+                mountpoint_str.clone(),
+            )
+            .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+        }
+
         // Branch: with control socket → Session::new + notifier() + se.run().
         // Without → mount2 (blocks until unmount; current behaviour).
         match &cli.control_socket {
@@ -604,6 +633,7 @@ mod linux_main {
                     verified_layers: verified_layers.clone(),
                     mount_time: std::time::SystemTime::now(),
                     root: layered_root,
+                    stats,
                 });
                 // Session::new gives us the same blocking se.run() as
                 // mount2() but lets us pull notifier() out first for the

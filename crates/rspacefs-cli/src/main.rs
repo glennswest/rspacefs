@@ -53,6 +53,21 @@ enum CtlOp {
     /// Forces the kernel to re-enter the daemon on next access; used after
     /// a manifest rotation, layer swap, or other live-state change.
     Invalidate,
+    /// Snapshot of every counter and gauge as JSON.
+    Stats,
+    /// Counters in Prometheus text-exposition format. Pipe into a scraper
+    /// or `curl | promtool check metrics -`.
+    Metrics,
+    /// Config + binary version + pid + fuse-passthrough flag.
+    Info,
+    /// Recent FUSE op ring (newest first). `--n` caps the count.
+    Ops {
+        #[arg(long, default_value_t = 32)]
+        n: usize,
+    },
+    /// Internal-state dump for debugging: open handles, RSS, last-op
+    /// timestamp, layer count.
+    Debug,
 }
 
 #[derive(Subcommand)]
@@ -130,10 +145,19 @@ fn run_ctl(socket: PathBuf, op: CtlOp) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let request = match op {
-        CtlOp::Ping => r#"{"cmd":"ping"}"#,
-        CtlOp::Status => r#"{"cmd":"status"}"#,
-        CtlOp::Invalidate => r#"{"cmd":"invalidate"}"#,
+    // `metrics` strips the JSON envelope and prints `.data` raw so the
+    // output is valid Prometheus exposition text (curl-pipe-able into a
+    // scraper). Every other op pretty-prints the response JSON.
+    let raw_metrics = matches!(op, CtlOp::Metrics);
+    let request: String = match op {
+        CtlOp::Ping => r#"{"cmd":"ping"}"#.into(),
+        CtlOp::Status => r#"{"cmd":"status"}"#.into(),
+        CtlOp::Invalidate => r#"{"cmd":"invalidate"}"#.into(),
+        CtlOp::Stats => r#"{"cmd":"stats"}"#.into(),
+        CtlOp::Metrics => r#"{"cmd":"metrics-text"}"#.into(),
+        CtlOp::Info => r#"{"cmd":"info"}"#.into(),
+        CtlOp::Ops { n } => format!(r#"{{"cmd":"ops","n":{}}}"#, n),
+        CtlOp::Debug => r#"{"cmd":"debug"}"#.into(),
     };
 
     let mut stream = UnixStream::connect(&socket)
@@ -146,7 +170,21 @@ fn run_ctl(socket: PathBuf, op: CtlOp) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    // Pretty-print JSON for readability.
+    if raw_metrics {
+        // Response envelope is {ok, data} where data is the Prometheus
+        // text. Pull `data` out and print it verbatim.
+        let v: serde_json::Value =
+            serde_json::from_str(&line).context("daemon returned non-JSON response")?;
+        if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            let msg = v.get("error").and_then(|x| x.as_str()).unwrap_or("unknown");
+            bail!("metrics-text request failed: {}", msg);
+        }
+        let text = v.get("data").and_then(|x| x.as_str()).unwrap_or("");
+        print!("{}", text);
+        return Ok(());
+    }
+
+    // Default: pretty-print JSON for readability.
     match serde_json::from_str::<serde_json::Value>(&line) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
         Err(_) => print!("{}", line),

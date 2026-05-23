@@ -7,18 +7,27 @@
 //!
 //! ## Protocol
 //!
-//! Request:
+//! Request (one JSON object per line):
 //! ```text
+//! { "cmd": "ping" }
 //! { "cmd": "status" }
 //! { "cmd": "invalidate" }
-//! { "cmd": "ping" }
+//! { "cmd": "stats" }
+//! { "cmd": "metrics-text" }
+//! { "cmd": "info" }
+//! { "cmd": "ops", "n": 32 }
+//! { "cmd": "debug" }
 //! ```
 //!
-//! Response:
+//! Response (one JSON object per line):
 //! ```text
 //! { "ok": true, "data": { ... } }
 //! { "ok": false, "error": "..." }
 //! ```
+//!
+//! `metrics-text` puts the Prometheus exposition text inside `data` as a
+//! single string; the CLI `rspacefs ctl ... metrics` strips the envelope
+//! so the output is a clean Prometheus payload pipe-able into a scraper.
 //!
 //! ## Notifier integration (item D)
 //!
@@ -48,6 +57,8 @@ use fuser::Notifier;
 use serde::{Deserialize, Serialize};
 use vfs::VfsPath;
 
+use crate::stats::{render_prom, Stats};
+
 const ROOT_INO: u64 = 1;
 
 /// Read-mostly snapshot of the mount's configuration, shared between the
@@ -63,14 +74,41 @@ pub struct ControlState {
     /// Root of the merged tree as a `VfsPath` — used by `invalidate` to
     /// enumerate top-level entries.
     pub root: VfsPath,
+    /// Operational counters and gauges. Cloned from the FS adapter at
+    /// startup so `stats` / `metrics-text` / `ops` reads don't lock the FS.
+    pub stats: Arc<Stats>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 enum Request {
+    /// Round-trip liveness probe.
     Ping,
+    /// Mount configuration snapshot (paths, layers, uptime).
     Status,
+    /// `FUSE_NOTIFY_INVAL_ENTRY` for every top-level merged entry.
     Invalidate,
+    /// JSON snapshot of every counter and gauge.
+    Stats,
+    /// Prometheus text-format dump of the same counters. Pipe straight
+    /// into a scrape target.
+    MetricsText,
+    /// Config + binary-version dump. Subset of `status` with `version`,
+    /// pid, executable path, fuse-passthrough capability.
+    Info,
+    /// Recent FUSE op ring (most-recent first). `n` caps the count.
+    #[serde(rename = "ops")]
+    Ops {
+        #[serde(default = "default_ops_limit")]
+        n: usize,
+    },
+    /// Internal-state dump for debugging. Open-handle count, RSS bytes,
+    /// last-op timestamp, layer count.
+    Debug,
+}
+
+fn default_ops_limit() -> usize {
+    32
 }
 
 #[derive(Serialize)]
@@ -102,6 +140,30 @@ struct LowerInfo {
 struct InvalidateData {
     entries_invalidated: usize,
     errors: usize,
+}
+
+#[derive(Serialize)]
+struct InfoData {
+    mountpoint: String,
+    upper: String,
+    lower_count: usize,
+    verified_lower_count: usize,
+    uptime_secs: u64,
+    version: &'static str,
+    pid: u32,
+    exe: String,
+    fuse_passthrough: bool,
+}
+
+#[derive(Serialize)]
+struct DebugData {
+    pid: u32,
+    open_handles: i64,
+    last_op_unix_ms: u64,
+    uptime_secs: u64,
+    rss_bytes: Option<u64>,
+    mountpoint: String,
+    layer_count: usize,
 }
 
 /// Spawn the control-socket listener thread. Returns the listener so the
@@ -180,7 +242,70 @@ fn dispatch(req: Request, state: &ControlState, notifier: &Notifier) -> String {
             Ok(data) => to_ok(&data),
             Err(e) => to_err(&e.to_string()),
         },
+        Request::Stats => to_ok(&state.stats.snapshot()),
+        Request::MetricsText => {
+            // Wrap the Prometheus text dump in the same Response envelope
+            // so clients can pipe `.data` straight to a scrape target.
+            let snap = state.stats.snapshot();
+            let mp = state.mountpoint.display().to_string();
+            to_ok(&render_prom(&snap, &mp))
+        }
+        Request::Info => to_ok(&info_payload(state)),
+        Request::Ops { n } => to_ok(&state.stats.recent(n)),
+        Request::Debug => to_ok(&debug_payload(state)),
     }
+}
+
+fn info_payload(state: &ControlState) -> InfoData {
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    InfoData {
+        mountpoint: state.mountpoint.display().to_string(),
+        upper: state.upper.display().to_string(),
+        lower_count: state.lowers.len(),
+        // verified_layers[0] is the upper — skip it for the lower count.
+        verified_lower_count: state.verified_layers.iter().skip(1).filter(|v| **v).count(),
+        uptime_secs: state.mount_time.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+        version: env!("CARGO_PKG_VERSION"),
+        pid: std::process::id(),
+        exe,
+        fuse_passthrough: true,
+    }
+}
+
+fn debug_payload(state: &ControlState) -> DebugData {
+    DebugData {
+        pid: std::process::id(),
+        open_handles: state
+            .stats
+            .open_handles
+            .load(std::sync::atomic::Ordering::Relaxed),
+        last_op_unix_ms: state
+            .stats
+            .last_op_unix_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        uptime_secs: state.mount_time.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+        rss_bytes: read_rss_bytes(),
+        mountpoint: state.mountpoint.display().to_string(),
+        // +1 because index 0 of verified_layers is the upper.
+        layer_count: state.verified_layers.len(),
+    }
+}
+
+/// Best-effort read of this process's RSS in bytes from /proc/self/status.
+/// Linux-only side-channel — fine since rspacefs-mount only runs on Linux.
+fn read_rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            // Format: `VmRSS:    1234 kB`
+            let n: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(n * 1024);
+        }
+    }
+    None
 }
 
 fn status_payload(state: &ControlState) -> StatusData {
