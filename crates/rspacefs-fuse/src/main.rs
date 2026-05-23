@@ -283,7 +283,10 @@ mod linux_main {
     /// True if the path's filesystem reports the FUSE magic. Used by the
     /// daemonize parent to confirm the mount is up before exiting.
     fn is_fuse_mounted(p: &std::path::Path) -> bool {
-        const FUSE_SUPER_MAGIC: libc::c_long = 0x65735546;
+        // `statfs::f_type` is `__fsword_t` on Linux — same type, same width
+        // as the magic constant. Cross-arch portable as long as we land here
+        // only on Linux (this whole module is `#[cfg(target_os = "linux")]`).
+        const FUSE_SUPER_MAGIC: libc::__fsword_t = 0x65735546;
         let c = match std::ffi::CString::new(p.to_string_lossy().as_bytes()) {
             Ok(c) => c,
             Err(_) => return false,
@@ -292,7 +295,7 @@ mod linux_main {
         if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
             return false;
         }
-        i64::from(buf.f_type) == FUSE_SUPER_MAGIC as i64
+        buf.f_type == FUSE_SUPER_MAGIC
     }
 
     fn parse_overlay_options(

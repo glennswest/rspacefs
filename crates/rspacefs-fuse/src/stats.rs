@@ -14,14 +14,13 @@
 //!
 //! Three views are exposed via the control socket:
 //!
-//! - `stats`        JSON snapshot of every counter and gauge.
-//! - `metrics-text` Prometheus text-format dump of the same data — `curl`
-//!                  the control socket and pipe straight into a scraper.
-//! - `ops`          A short ring of the most recent ops with timestamps,
-//!                  durations, and result codes — what's been happening
-//!                  in the last few seconds.
-//! - `debug`        Internal state dump: open handles, backing-cache size,
-//!                  pid, rss bytes, mount paths.
+//! - `stats` — JSON snapshot of every counter and gauge.
+//! - `metrics-text` — Prometheus text-format dump of the same data; `curl`
+//!   the control socket and pipe straight into a scraper.
+//! - `ops` — short ring of the most recent ops with timestamps, durations,
+//!   and result codes — what's been happening in the last few seconds.
+//! - `debug` — internal state dump: open handles, backing-cache size, pid,
+//!   rss bytes, mount paths.
 //!
 //! Each rspacefs-mount process is one-mount-per-process under
 //! `mount_program`, so a node-level scrape collects from every PID. A
