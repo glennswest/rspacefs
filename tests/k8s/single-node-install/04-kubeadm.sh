@@ -50,16 +50,34 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 [ -S /var/run/crio/crio.sock ] || die "crio socket not present after 10s — check 'systemctl status crio'"
 
+log "writing kubeadm config (kube-proxy mode=nftables)"
+# Why nftables: kube-proxy's container ships an iptables-wrapper that picks
+# iptables-legacy vs iptables-nft based on detection of host rule patterns.
+# On modern Fedora the detection is flaky and we've seen kube-proxy crash
+# with "iptables is not available on this host" even though both binaries
+# are present. Native nftables mode (k8s 1.31+ beta, GA in 1.33) bypasses
+# the wrapper entirely and talks to nf_tables via the kernel API.
+KUBEADM_CFG=/etc/kubernetes/kubeadm-config.yaml
+mkdir -p /etc/kubernetes
+cat >"$KUBEADM_CFG" <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: unix:///var/run/crio/crio.sock
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+networking:
+  podSubnet: ${POD_CIDR}
+  serviceSubnet: ${SERVICE_CIDR}
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: nftables
+EOF
+
 log "running kubeadm init (this can take ~60s while it pulls control-plane images)"
-# --pod-network-cidr matches what we'll tell the CNI. We keep kube-proxy
-# (no --skip-phases) because flannel needs it. If you switch CNI=cilium
-# in 05-cni and want Cilium's eBPF dataplane to replace kube-proxy, add
-# back --skip-phases=addon/kube-proxy here.
-kubeadm init \
-  --pod-network-cidr="${POD_CIDR}" \
-  --service-cidr="${SERVICE_CIDR}" \
-  --cri-socket=unix:///var/run/crio/crio.sock \
-  | tee /var/log/kubeadm-init.log
+kubeadm init --config="$KUBEADM_CFG" | tee /var/log/kubeadm-init.log
 
 log "setting up kubeconfig for the invoking user"
 INSTALL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
