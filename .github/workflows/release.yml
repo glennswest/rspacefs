@@ -1,8 +1,27 @@
 name: release
 
+# Releases are **alpha** by default — that's how we ship until manually
+# promoted. Two ways the type gets set:
+#
+#   1. Tag suffix: vX.Y.Z-alpha.N / vX.Y.Z-beta.N / vX.Y.Z-rc.N → that
+#      flavor. Plain vX.Y.Z (no suffix) → still alpha by default.
+#   2. workflow_dispatch — manual run with the `release_type` input
+#      = alpha | beta | production.
+#
+# Only `production` flips prerelease=false on the GitHub Release.
+# alpha and beta both keep prerelease=true.
+
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'alpha (default) | beta | production'
+        required: false
+        default: alpha
+        type: choice
+        options: [alpha, beta, production]
 
 permissions:
   contents: write   # to upload assets to the release
@@ -11,8 +30,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Compute the release type once, share with all build jobs.
+  resolve:
+    name: resolve release type
+    runs-on: ubuntu-latest
+    outputs:
+      release_type: ${{ steps.x.outputs.release_type }}
+      prerelease:   ${{ steps.x.outputs.prerelease }}
+    steps:
+      - id: x
+        run: |
+          # Manual dispatch input wins. Otherwise infer from tag suffix.
+          if [ -n "${{ inputs.release_type }}" ]; then
+            t="${{ inputs.release_type }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+            case "$tag" in
+              *-alpha*|*-a.*) t=alpha ;;
+              *-beta*|*-b.*)  t=beta  ;;
+              *-rc*)          t=beta  ;;
+              *)              t=alpha ;;  # default is alpha — promote manually via workflow_dispatch
+            esac
+          fi
+          case "$t" in
+            production) pr=false ;;
+            *)          pr=true  ;;
+          esac
+          echo "release_type=$t" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$pr"  >>"$GITHUB_OUTPUT"
+          echo "resolved: release_type=$t prerelease=$pr"
+
   build:
-    name: build ${{ matrix.arch }}
+    needs: resolve
+    name: build ${{ matrix.arch }} (${{ needs.resolve.outputs.release_type }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -52,10 +102,43 @@ jobs:
           (cd dist && sha256sum "${out}.tar.gz" > "${out}.tar.gz.sha256")
           echo "tarball=dist/${out}.tar.gz" >>"$GITHUB_OUTPUT"
           echo "shafile=dist/${out}.tar.gz.sha256" >>"$GITHUB_OUTPUT"
-      - name: upload to release
+      # Upload artifacts so they're attached to the workflow run no
+      # matter which forge we're on.
+      - name: upload build artifacts to the workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: rspacefs-${{ github.ref_name }}-${{ matrix.arch }}-linux
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.shafile }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # The release ALWAYS lands on github.com/glennswest/rspacefs.
+      # That's the canonical surface — issues, PRs, public docs all
+      # reference GitHub tags. Forcicd builds the artifacts (faster,
+      # local toolchains), then this step pushes them to the GitHub
+      # release for the same tag.
+      #
+      # Token resolution:
+      #   - On GitHub: GITHUB_TOKEN has contents:write per the
+      #     permissions block at the top of this file.
+      #   - On Forgejo (forcicd.g8.lo): GITHUB_TOKEN is a Forgejo-issued
+      #     token that has no GitHub.com scope. Repo admin must set a
+      #     secret `GH_PAT` = a fine-grained PAT scoped to this repo
+      #     with "Contents: read & write" — only used by this step.
+      #
+      # The conditional picks the right one.
+      - name: attach to GitHub Release (canonical)
         uses: softprops/action-gh-release@v2
         with:
+          repository: glennswest/rspacefs
+          token: ${{ github.server_url == 'https://github.com' && secrets.GITHUB_TOKEN || secrets.GH_PAT }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }} (${{ needs.resolve.outputs.release_type }})
+          prerelease: ${{ needs.resolve.outputs.prerelease == 'true' }}
           files: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.shafile }}
           generate_release_notes: true
+          fail_on_unmatched_files: true

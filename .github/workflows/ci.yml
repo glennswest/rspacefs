@@ -36,22 +36,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Linux runs the real tests. macOS proves the stub path on
-        # rspacefs-fuse still compiles — every regression there blocks
-        # local dev on Mac, so we catch it in CI.
-        os: [ubuntu-latest, macos-latest]
+  test-linux:
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --all-targets
+
+  test-macos:
+    name: test (macos-latest)
+    # macOS proves the rspacefs-fuse stub-path still compiles on
+    # non-Linux. Only github-hosted runners ship macOS — skip on Forgejo
+    # mirrors / forcicd / any non-github CI so the run doesn't queue
+    # forever waiting for a runner that doesn't exist.
+    if: github.server_url == 'https://github.com'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
 
   build-linux:
     name: build linux release (${{ matrix.arch }})
