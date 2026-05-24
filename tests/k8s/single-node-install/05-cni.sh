@@ -36,6 +36,18 @@ case "$CNI" in
       # with the right pod-subnet IP on first run.
       ip link delete cni0 2>/dev/null || true
       systemctl restart crio
+      # Restarting crio takes the apiserver sandbox down with it; wait for
+      # it to come back before kubectl-apply'ing flannel.
+      log "waiting for apiserver to come back after crio restart"
+      for _ in $(seq 1 60); do
+        if kubectl get --raw=/healthz >/dev/null 2>&1; then
+          log "apiserver reachable"
+          break
+        fi
+        sleep 2
+      done
+      kubectl get --raw=/healthz >/dev/null 2>&1 \
+        || die "apiserver did not come back within 120s after crio restart"
     fi
 
     # Flannel default pod CIDR is 10.244.0.0/16 — must match what kubeadm
