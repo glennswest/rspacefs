@@ -21,3 +21,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rspacefs-core = { path = "../rspacefs-core" }
+tempfile = "3"

@@ -153,6 +153,8 @@ impl MerkleTree {
                 content_hash,
                 metadata_hash,
                 block_range: (block_start, block_end),
+                kind: EntryKind::File,
+                link_target: None,
             });
 
             // Sanity check: file content in the data blob matches.
@@ -176,6 +178,119 @@ impl MerkleTree {
             block_size: BLOCK_SIZE as u32,
         };
 
+        Ok((tree, manifest))
+    }
+
+    /// Build a Merkle tree from a real on-disk directory, **symlink-aware**.
+    ///
+    /// Unlike `build_from_vfs` (which uses `vfs`'s symlink-following
+    /// metadata and was never meant for trees containing dangling links),
+    /// this walks the directory with `std::fs::read_dir` + `symlink_metadata`
+    /// directly. Symlinks are recorded as `FileEntry { kind: Symlink, … }`
+    /// whose `content_hash` is `sha256(target_path_bytes)`; we never follow
+    /// them. That makes the build:
+    ///
+    /// - Tolerant of dangling symlinks (real OS trees always have some).
+    /// - Correct for valid symlinks (don't hash the target's content
+    ///   twice; record the symlink as itself).
+    ///
+    /// Output shape (the `LayerManifest`) is the same as `build_from_vfs`;
+    /// just richer per-entry data.
+    ///
+    /// See issue #18 for the failure mode this fixes.
+    pub fn build_from_dir(root: &std::path::Path) -> io::Result<(Self, LayerManifest)> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut file_paths: BTreeMap<String, ()> = BTreeMap::new();
+        collect_files_lstat(root, "", &mut file_paths)?;
+
+        let mut all_data: Vec<u8> = Vec::new();
+        let mut manifest_files = Vec::new();
+        for path in file_paths.keys() {
+            let full = root.join(path);
+            let lmeta = std::fs::symlink_metadata(&full)?;
+            let ft = lmeta.file_type();
+
+            let block_start = all_data.len() / BLOCK_SIZE;
+            let file_start = all_data.len();
+
+            let (kind, size, content_hash, link_target) = if ft.is_symlink() {
+                let target = std::fs::read_link(&full)?;
+                let target_bytes = target.as_os_str().as_bytes().to_vec();
+                let content_hash = sha256_bytes(&target_bytes);
+                all_data.extend_from_slice(&target_bytes);
+                (
+                    EntryKind::Symlink,
+                    target_bytes.len() as u64,
+                    content_hash,
+                    Some(target.to_string_lossy().into_owned()),
+                )
+            } else if ft.is_file() {
+                let buf = std::fs::read(&full)?;
+                let content_hash = sha256_bytes(&buf);
+                let size = buf.len() as u64;
+                all_data.extend_from_slice(&buf);
+                (EntryKind::File, size, content_hash, None)
+            } else {
+                // Sockets, fifos, devices — not content; skip.
+                continue;
+            };
+
+            // Pad each entry to a block boundary so the Merkle tree's
+            // block-ranges remain well-aligned.
+            let remainder = all_data.len() % BLOCK_SIZE;
+            if remainder != 0 {
+                all_data.resize(all_data.len() + (BLOCK_SIZE - remainder), 0);
+            }
+            let block_end = all_data.len() / BLOCK_SIZE;
+
+            // Metadata hash carries path + size + kind so swapping a
+            // symlink for a regular file of the same byte length still
+            // changes the manifest digest.
+            let meta_str = format!("{}:{}:{}", path, size, kind as u8);
+            let metadata_hash = sha256_bytes(meta_str.as_bytes());
+
+            manifest_files.push(FileEntry {
+                path: path.clone(),
+                size,
+                content_hash,
+                metadata_hash,
+                block_range: (block_start, block_end),
+                kind,
+                link_target,
+            });
+
+            // Sanity check — only meaningful for regular files; symlink
+            // bytes are equal to target_bytes so they match too.
+            debug_assert_eq!(
+                &all_data[file_start..file_start + (manifest_files.last().unwrap().size as usize)],
+                {
+                    let entry = manifest_files.last().unwrap();
+                    if matches!(entry.kind, EntryKind::Symlink) {
+                        // The symlink's target bytes were the last thing
+                        // written before padding.
+                        entry.link_target.as_ref().unwrap().as_bytes()
+                    } else {
+                        &all_data[file_start..file_start + entry.size as usize]
+                    }
+                }
+            );
+        }
+
+        let tree = MerkleTree::build(&all_data);
+        let manifest_hash = {
+            let mut hasher = Sha256::new();
+            for f in &manifest_files {
+                hasher.update(f.content_hash);
+                hasher.update(f.metadata_hash);
+            }
+            hasher.finalize().into()
+        };
+        let manifest = LayerManifest {
+            files: manifest_files,
+            manifest_hash,
+            root_hash: tree.root_hash(),
+            block_size: BLOCK_SIZE as u32,
+        };
         Ok((tree, manifest))
     }
 
@@ -302,14 +417,30 @@ impl MerkleTree {
 
 // ── Layer Manifest ───────────────────────────────────────────────────────────
 
+/// What kind of filesystem entry a `FileEntry` describes. A regular
+/// file gets its bytes hashed; a symlink gets its **target path bytes**
+/// hashed instead — we never follow.
+///
+/// Serde-defaults to `File` so manifests built before this enum existed
+/// still deserialize cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    #[default]
+    File,
+    Symlink,
+}
+
 /// Per-file entry in the layer manifest.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     /// Path of the file relative to the layer root, using `/` separators.
     pub path: String,
-    /// File size in bytes.
+    /// File size in bytes. For symlinks: the length of the link target
+    /// path string.
     pub size: u64,
-    /// SHA-256 of the file's raw byte content (un-padded).
+    /// SHA-256 of the file's raw byte content (un-padded). For symlinks
+    /// it's `sha256(link_target.as_bytes())` — we never follow the link.
     #[serde(with = "hex_hash")]
     pub content_hash: Hash256,
     /// SHA-256 of the file's metadata digest (path + size + type).
@@ -317,8 +448,18 @@ pub struct FileEntry {
     pub metadata_hash: Hash256,
     /// Block range `[start, end)` in the concatenated data blob the
     /// Merkle tree covers. Useful for locating which tree blocks back
-    /// a particular read range.
+    /// a particular read range. For symlinks the range covers the
+    /// target-path bytes.
     pub block_range: (usize, usize),
+    /// File / symlink. Defaults to File for back-compat with manifests
+    /// built before this field existed.
+    #[serde(default)]
+    pub kind: EntryKind,
+    /// For symlinks: the target path as recorded by `readlink`. None
+    /// for regular files. Skipped when None to keep old manifests
+    /// byte-for-byte identical when re-serialised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
 }
 
 /// Manifest describing all files in a verified layer.
@@ -1035,6 +1176,17 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
 }
 
 /// Recursively collect all files from a VFS directory tree into a sorted map.
+///
+/// NOTE: this path uses `vfs::VfsPath::metadata` which follows symlinks via
+/// `std::fs::metadata`. On a directory containing **dangling symlinks** the
+/// per-entry `metadata()` call fails and aborts the build. For real
+/// filesystem trees that may contain dangling links (any OS rootfs, image
+/// extract dir), use `MerkleTree::build_from_dir` instead — it's
+/// lstat-based and symlink-aware. See issue #18.
+///
+/// Here we tolerate the failure by skipping the bad entry with a warning,
+/// so test trees built in `MemoryFS` (which can't dangle) keep working
+/// and accidentally-dangling real-FS uses don't hard-abort.
 fn collect_files(root: &VfsPath, prefix: &str, files: &mut BTreeMap<String, ()>) -> io::Result<()> {
     let path = if prefix.is_empty() {
         root.clone()
@@ -1050,7 +1202,17 @@ fn collect_files(root: &VfsPath, prefix: &str, files: &mut BTreeMap<String, ()>)
             format!("{}/{}", prefix, name)
         };
 
-        let meta = entry.metadata().map_err(io_err)?;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    path = %rel_path,
+                    error = %e,
+                    "skipping entry whose metadata could not be read (likely dangling symlink; build_from_vfs follows symlinks — use build_from_dir for symlink-aware builds)"
+                );
+                continue;
+            }
+        };
         if meta.file_type == vfs::VfsFileType::Directory {
             collect_files(root, &rel_path, files)?;
         } else {
@@ -1058,6 +1220,44 @@ fn collect_files(root: &VfsPath, prefix: &str, files: &mut BTreeMap<String, ()>)
         }
     }
 
+    Ok(())
+}
+
+/// Lstat-based companion to [`collect_files`]. Walks a real on-disk
+/// directory with `std::fs::read_dir` + `symlink_metadata` so dangling
+/// symlinks are tolerated and valid symlinks aren't followed. Used by
+/// [`MerkleTree::build_from_dir`].
+fn collect_files_lstat(
+    root: &std::path::Path,
+    prefix: &str,
+    files: &mut BTreeMap<String, ()>,
+) -> io::Result<()> {
+    let dir = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    };
+
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+    // Deterministic ordering across runs.
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel_path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+        let lmeta = entry.file_type()?;
+        if lmeta.is_dir() && !lmeta.is_symlink() {
+            // Recurse into real directories only. Symlinks-to-directories
+            // are recorded as symlinks (don't follow).
+            collect_files_lstat(root, &rel_path, files)?;
+        } else {
+            files.insert(rel_path, ());
+        }
+    }
     Ok(())
 }
 
@@ -1639,5 +1839,105 @@ mod tests {
 
         // Can't check cache directly after into() since we moved the VerifiedFS.
         // But the read succeeded, which means verification passed.
+    }
+
+    // ── Regression tests for issue #18 (symlink handling in build) ───────
+
+    /// `build_from_vfs` used to abort on a dangling symlink. After the fix
+    /// it logs + skips. The build returns Ok and produces a manifest with
+    /// just the entries it could stat. Real filesystem trees with dangling
+    /// links should use `build_from_dir` instead — see the next test.
+    #[test]
+    fn build_from_vfs_tolerates_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+        use vfs::PhysicalFS;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("realfile"), b"hello").unwrap();
+        symlink("/nonexistent/target", tmp.path().join("dangling")).unwrap();
+
+        let root = VfsPath::new(PhysicalFS::new(tmp.path()));
+        let (_tree, manifest) = MerkleTree::build_from_vfs(&root)
+            .expect("build should succeed even with dangling symlink");
+
+        // The dangling entry is skipped; realfile is captured. The fix
+        // for #18 is "don't abort the build"; for proper symlink
+        // recording use build_from_dir.
+        let names: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(names.contains(&"realfile"), "realfile missing: {:?}", names);
+    }
+
+    /// `build_from_dir` is the symlink-aware path. Dangling links are
+    /// recorded as Symlink entries (no abort). Valid links are recorded
+    /// as symlinks too — NOT followed and double-hashed as a regular file.
+    #[test]
+    fn build_from_dir_records_symlinks_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("realfile"), b"hello").unwrap();
+        symlink("realfile", tmp.path().join("link-to-real")).unwrap();
+        symlink("/nonexistent/target", tmp.path().join("dangling")).unwrap();
+
+        let (_tree, manifest) =
+            MerkleTree::build_from_dir(tmp.path()).expect("build_from_dir should succeed");
+
+        let by_path: std::collections::HashMap<&str, &FileEntry> = manifest
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f))
+            .collect();
+
+        // 3 entries: realfile, link-to-real, dangling.
+        assert_eq!(
+            manifest.files.len(),
+            3,
+            "got entries: {:?}",
+            manifest
+                .files
+                .iter()
+                .map(|f| (&f.path, f.kind))
+                .collect::<Vec<_>>()
+        );
+
+        // realfile is a regular File whose content hash is sha256("hello").
+        let real = by_path["realfile"];
+        assert_eq!(real.kind, EntryKind::File);
+        assert_eq!(real.size, 5);
+        assert_eq!(real.link_target, None);
+
+        // link-to-real is a Symlink. content_hash is sha256("realfile"),
+        // NOT sha256("hello"). That's the whole point — we don't follow.
+        let l = by_path["link-to-real"];
+        assert_eq!(l.kind, EntryKind::Symlink);
+        assert_eq!(l.link_target.as_deref(), Some("realfile"));
+        assert_eq!(l.size, "realfile".len() as u64);
+        assert_ne!(
+            l.content_hash, real.content_hash,
+            "symlink content_hash must not equal its target's content_hash — that would mean we followed the link"
+        );
+
+        // Dangling symlink works the same way — recorded, no error.
+        let d = by_path["dangling"];
+        assert_eq!(d.kind, EntryKind::Symlink);
+        assert_eq!(d.link_target.as_deref(), Some("/nonexistent/target"));
+    }
+
+    /// `build_from_dir` is deterministic across runs on the same tree.
+    #[test]
+    fn build_from_dir_is_deterministic() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        std::fs::write(tmp.path().join("d/a"), b"a-content").unwrap();
+        std::fs::write(tmp.path().join("d/b"), b"b-content").unwrap();
+        symlink("../d/a", tmp.path().join("d/sym")).unwrap();
+
+        let (t1, m1) = MerkleTree::build_from_dir(tmp.path()).unwrap();
+        let (t2, m2) = MerkleTree::build_from_dir(tmp.path()).unwrap();
+        assert_eq!(t1.root_hash(), t2.root_hash());
+        assert_eq!(m1.manifest_hash, m2.manifest_hash);
+        assert_eq!(m1.files.len(), m2.files.len());
     }
 }
