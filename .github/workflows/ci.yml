@@ -1,5 +1,16 @@
 name: ci
 
+# CI runs on forcicd.g8.lo (Forgejo + act_runner) — not on GitHub Actions.
+# We're conserving GitHub Actions bandwidth; forcicd is canonical for the
+# CI loop. Every job below carries an `if: github.server_url !=
+# 'https://github.com'` gate so the GitHub side records the workflow_run
+# but skips every job (zero minutes consumed). The Forgejo mirror at
+# http://forcicd.g8.lo:3000/ci/rspacefs runs everything normally.
+#
+# If you ever NEED GitHub-side CI (security audit, public PR verification,
+# external contributor without LAN access), remove the gates or override
+# via workflow_dispatch from the GitHub UI.
+
 on:
   push:
     branches: [main]
@@ -17,6 +28,7 @@ env:
 jobs:
   fmt:
     name: fmt
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +39,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +51,7 @@ jobs:
 
   test-linux:
     name: test (ubuntu-latest)
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,13 +59,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.3
       - run: cargo test --workspace --all-targets
 
+  # macOS proves the rspacefs-fuse stub-path still compiles on
+  # non-Linux. forcicd doesn't ship a Mac runner image, and we've moved
+  # CI off GH, so this is effectively disabled. Re-enable by removing
+  # `false &&` if you want a macOS verification run via GH workflow_dispatch.
   test-macos:
     name: test (macos-latest)
-    # macOS proves the rspacefs-fuse stub-path still compiles on
-    # non-Linux. Only github-hosted runners ship macOS — skip on Forgejo
-    # mirrors / forcicd / any non-github CI so the run doesn't queue
-    # forever waiting for a runner that doesn't exist.
-    if: github.server_url == 'https://github.com'
+    if: false && github.server_url == 'https://github.com'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +75,7 @@ jobs:
 
   build-linux:
     name: build linux release (${{ matrix.arch }})
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -88,18 +103,7 @@ jobs:
             --target ${{ matrix.arch }}-unknown-linux-gnu \
             -p rspacefs-fuse -p rspacefs-cli
           ls -la target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs-mount target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs
-      - name: upload artifacts
-        # actions/upload-artifact@v4 hard-rejects non-github.com servers
-        # ("GHESNotSupportedError"); skip on Forgejo / forcicd. Forgejo's
-        # own artifact UX isn't useful for us anyway — what we want from
-        # forcicd is the release-publish step further down which pushes
-        # binaries to GitHub Releases directly.
-        if: github.server_url == 'https://github.com'
-        uses: actions/upload-artifact@v4
-        with:
-          name: rspacefs-${{ matrix.arch }}-linux
-          path: |
-            target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs-mount
-            target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs
-          if-no-files-found: error
-          retention-days: 14
+      # Artifacts go to forcicd's job-page log (no separate upload step
+      # since actions/upload-artifact@v4 rejects Forgejo). For release
+      # tags, release.yml's softprops/action-gh-release publishes to
+      # GitHub Releases.

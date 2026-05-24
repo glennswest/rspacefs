@@ -33,6 +33,12 @@ jobs:
   # Compute the release type once, share with all build jobs.
   resolve:
     name: resolve release type
+    # Builds + release-publish happen on forcicd (GitHub Actions
+    # bandwidth conservation). The GitHub side skips every job; the
+    # softprops/action-gh-release step inside the build job runs on
+    # forcicd and publishes binaries to github.com via the GH_PAT
+    # secret. See ci.yml for the same gate + the cross-forge rationale.
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     outputs:
       release_type: ${{ steps.x.outputs.release_type }}
@@ -63,6 +69,7 @@ jobs:
   build:
     needs: resolve
     name: build ${{ matrix.arch }} (${{ needs.resolve.outputs.release_type }})
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
