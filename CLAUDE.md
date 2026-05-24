@@ -4,6 +4,31 @@ Pure-Rust userspace LayerFS + dm-verity for container image rootfs.
 Mounts via FUSE; plugs into containers-storage as `mount_program` so
 CRI-O / podman delegate every image mount to rspacefs.
 
+## Issue-first practice
+
+**Every bug we find or fix gets a GitHub Issue.** No exceptions, even
+if the fix lands in the same PR. Open it, link the commit, close it.
+Reasons:
+
+1. The project's bug-tracking history IS the project's track record.
+   "We've found and fixed N real bugs" is more credible than "trust us
+   it works."
+2. Future-someone debugging a regression needs to find prior context;
+   the commit message alone is not searchable from a stack trace.
+3. Anyone evaluating rspacefs against alternatives can read the issue
+   tracker and see actual operational behavior, not just feature claims.
+
+Workflow:
+1. As soon as a bug is identified, file an issue with `gh issue create`
+   describing **summary, root cause, live observation, severity, fix**.
+2. Fix it. Reference the issue in the commit message: `closes #N` or
+   `refs #N`.
+3. Close the issue with `gh issue close N --reason completed --comment
+   "Fixed in <sha>"`.
+
+Labels in use: `bug`, `enhancement`, `fixed`, `core`, `fuse`,
+`tests/k8s`. Add more as needed.
+
 ## Build & Test
 
 ```bash
