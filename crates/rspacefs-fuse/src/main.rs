@@ -199,10 +199,21 @@ mod linux_main {
             MountOption::FSName("rspacefs".to_string()),
             MountOption::Subtype("rspacefs".to_string()),
             MountOption::DefaultPermissions,
+            // mount_program serves container rootfs that is then accessed
+            // by the container's PID namespace under arbitrary UIDs (e.g.
+            // coredns runs as uid 65532). Without allow_other, FUSE
+            // rejects ALL non-mounter UIDs at the VFS layer — before mode
+            // bits are even checked — so any non-root container gets
+            // EACCES on every file, including its own entrypoint binary
+            // ("exec container process /foo: Permission denied").
+            // Honoring the -o allow_other hint from storage.conf is not
+            // enough because containers-storage doesn't pass it. Set it
+            // unconditionally in mount_program mode.
+            MountOption::AllowOther,
         ];
-        if allow_other {
-            opts.push(MountOption::AllowOther);
-        }
+        // The `-o allow_other` flag from storage.conf is now redundant (we
+        // set it unconditionally) but we still honor explicit allow_root.
+        let _ = allow_other;
         if allow_root {
             opts.push(MountOption::AllowRoot);
         }
