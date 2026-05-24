@@ -89,6 +89,12 @@ jobs:
             -p rspacefs-fuse -p rspacefs-cli
           ls -la target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs-mount target/${{ matrix.arch }}-unknown-linux-gnu/release/rspacefs
       - name: upload artifacts
+        # actions/upload-artifact@v4 hard-rejects non-github.com servers
+        # ("GHESNotSupportedError"); skip on Forgejo / forcicd. Forgejo's
+        # own artifact UX isn't useful for us anyway — what we want from
+        # forcicd is the release-publish step further down which pushes
+        # binaries to GitHub Releases directly.
+        if: github.server_url == 'https://github.com'
         uses: actions/upload-artifact@v4
         with:
           name: rspacefs-${{ matrix.arch }}-linux

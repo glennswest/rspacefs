@@ -102,9 +102,13 @@ jobs:
           (cd dist && sha256sum "${out}.tar.gz" > "${out}.tar.gz.sha256")
           echo "tarball=dist/${out}.tar.gz" >>"$GITHUB_OUTPUT"
           echo "shafile=dist/${out}.tar.gz.sha256" >>"$GITHUB_OUTPUT"
-      # Upload artifacts so they're attached to the workflow run no
-      # matter which forge we're on.
+      # Attach the artifacts to the workflow run for human inspection.
+      # actions/upload-artifact@v4 hard-rejects non-github.com servers
+      # ("GHESNotSupportedError"), so this step is GH-only. Forcicd
+      # builds skip it; the next step (release-publish to GitHub)
+      # still runs, so the binaries land on the canonical release page.
       - name: upload build artifacts to the workflow run
+        if: github.server_url == 'https://github.com'
         uses: actions/upload-artifact@v4
         with:
           name: rspacefs-${{ github.ref_name }}-${{ matrix.arch }}-linux
