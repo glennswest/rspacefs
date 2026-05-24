@@ -73,7 +73,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.arch }}-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.7.3
       - name: install cross linker for aarch64
         if: matrix.arch == 'aarch64'
         run: |
@@ -130,7 +130,7 @@ jobs:
       #
       # The conditional picks the right one.
       - name: attach to GitHub Release (canonical)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.0.8
         with:
           repository: glennswest/rspacefs
           token: ${{ github.server_url == 'https://github.com' && secrets.GITHUB_TOKEN || secrets.GH_PAT }}
