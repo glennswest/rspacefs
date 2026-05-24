@@ -25,6 +25,19 @@ CNI="${CNI:-flannel}"
 
 case "$CNI" in
   flannel)
+    # CRI-O ships a default bridge config at /etc/cni/net.d/100-crio-bridge.conflist
+    # that assigns pod IPs from 10.85.0.0/24. If we leave it in place flannel
+    # can't take over cni0 (bridge already has the wrong IP) and pods end up
+    # on the wrong subnet. Evict the default before laying down flannel.
+    if [ -f /etc/cni/net.d/100-crio-bridge.conflist ] || [ -f /etc/cni/net.d/100-crio-bridge.conf ]; then
+      log "evicting CRI-O default bridge config (collides with flannel)"
+      rm -f /etc/cni/net.d/100-crio-bridge.conflist /etc/cni/net.d/100-crio-bridge.conf
+      # Tear down the already-built cni0 bridge so flannel can create it
+      # with the right pod-subnet IP on first run.
+      ip link delete cni0 2>/dev/null || true
+      systemctl restart crio
+    fi
+
     # Flannel default pod CIDR is 10.244.0.0/16 — must match what kubeadm
     # was initialised with. 04-kubeadm uses POD_CIDR=10.42.0.0/16 by
     # default; we substitute that into the flannel manifest before apply.
