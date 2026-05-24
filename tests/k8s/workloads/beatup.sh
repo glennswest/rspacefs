@@ -74,19 +74,19 @@ for img in "${IMAGES[@]}"; do
     name="beatup-seq-$run_n"
     run_n=$((run_n + 1))
     start=$(date +%s.%N)
+    # `kubectl run --attach --rm --restart=Never` blocks on container
+    # exit, prints its stdout, and cleans up the pod — one round-trip
+    # to the apiserver instead of run+wait+delete. The wait-for-Ready
+    # pattern was sampling a transient state the pod never sat in for a
+    # /bin/sh -c true workload (Pending → Running → Succeeded faster
+    # than kubectl could observe Ready), so every pod cost 15s of
+    # timeout regardless of real work (refs #10).
     kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
-        --command -- /bin/sh -c "true" >/dev/null 2>&1 || true
-    # The workloads exit in <1s and the image is already pulled in phase 1
-    # so a long timeout just stretches the wall-clock for no signal. 15s
-    # is plenty; if a run actually fails (e.g. mount error) it'll error
-    # immediately, not hang. The kubectl-wait pair waits for EITHER Ready
-    # (transient state for the 1-sec sleep) OR Succeeded (post-exit). One
-    # of the two short-circuits as soon as the pod state matches.
-    kubectl wait pod/"$name" -n "$NS" --for=condition=Ready --timeout=15s >/dev/null 2>&1 || \
-      kubectl wait pod/"$name" -n "$NS" --for=jsonpath='{.status.phase}'=Succeeded --timeout=15s >/dev/null 2>&1 || true
+        --attach --rm \
+        --command -- /bin/sh -c "true" >/dev/null 2>&1
+    rc=$?
     end=$(date +%s.%N)
-    phase=$(kubectl get pod -n "$NS" "$name" -o jsonpath='{.status.phase}' 2>/dev/null || echo Unknown)
-    kubectl delete pod "$name" -n "$NS" --wait=false >/dev/null 2>&1 || true
+    phase=$([ $rc -eq 0 ] && echo Succeeded || echo Failed)
     dur=$(awk "BEGIN { printf \"%.2f\", $end - $start }")
     echo "$img,$r,$dur,$phase" >>"$RUN_CSV"
   done
@@ -104,14 +104,14 @@ for round in 1 2; do
     i=$((i + 1))
     (
       start=$(date +%s.%N)
+      # `--attach --rm` waits for exit + cleans up; one round-trip
+      # instead of run+wait+delete (refs #10).
       kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
-          --command -- /bin/sh -c "true" >/dev/null 2>&1 || true
-      # Parallel storm runs 4-at-a-time so cumulative load is higher;
-      # 30s timeout (still 4× faster than the old 120s).
-      kubectl wait pod/"$name" -n "$NS" --for=jsonpath='{.status.phase}'=Succeeded --timeout=30s >/dev/null 2>&1 || true
+          --attach --rm \
+          --command -- /bin/sh -c "true" >/dev/null 2>&1
+      rc=$?
       end=$(date +%s.%N)
-      phase=$(kubectl get pod -n "$NS" "$name" -o jsonpath='{.status.phase}' 2>/dev/null || echo Unknown)
-      kubectl delete pod "$name" -n "$NS" --wait=false >/dev/null 2>&1 || true
+      phase=$([ $rc -eq 0 ] && echo Succeeded || echo Failed)
       dur=$(awk "BEGIN { printf \"%.2f\", $end - $start }")
       echo "$img,$round,$dur,$phase" >>"$PAR_CSV"
     ) &
