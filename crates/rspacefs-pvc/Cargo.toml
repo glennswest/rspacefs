@@ -1,0 +1,23 @@
+[package]
+name = "rspacefs-pvc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PVC primitives over rspacefs LayerFS: empty-lower mount, pivot-upper, capture-to-layer. Pure library — no FUSE, no IPC. Consumed by rspacefs-fuse (FUSE daemon), rspacefs-cli (offline tools), qregistry (registry inspection), and rspaced (boot agent)."
+
+[dependencies]
+rspacefs-core = { path = "../rspacefs-core" }
+vfs.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror = "1"
+tar = "0.4"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

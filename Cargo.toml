@@ -4,6 +4,8 @@ members = [
     "crates/rspacefs-verity",
     "crates/rspacefs-cli",
     "crates/rspacefs-fuse",
+    "crates/rspacefs-bigbust",
+    "crates/rspacefs-pvc",
 ]
 resolver = "2"
 
