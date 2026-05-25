@@ -150,10 +150,30 @@ mod linux_main {
         }
 
         let mountpoint = mountpoint.ok_or_else(|| anyhow!("no mountpoint argument"))?;
-        let upper = upper.ok_or_else(|| anyhow!("missing upperdir= in -o"))?;
         if lowers.is_empty() {
             bail!("no lowerdir= specified (or all empty)");
         }
+        // CRI-O always passes `upperdir=`; buildah / podman pass only
+        // `lowerdir=` for read-only overlay ops (image inspect, commit's
+        // source mount, layer-merge during pull). The kernel mounts those
+        // `ro` at the VFS layer so writes never happen. Synthesize an
+        // empty disposable tmpfs-style dir as the upper so LayerFS has
+        // something to compose against. See issue #19.
+        let (upper, _upper_tmpdir): (PathBuf, Option<std::path::PathBuf>) = match upper {
+            Some(u) => (u, None),
+            None => {
+                let pid = std::process::id();
+                let dir = std::env::temp_dir().join(format!("rspacefs-ro-{}", pid));
+                std::fs::create_dir_all(&dir).with_context(|| {
+                    format!("creating synthetic empty upper at {}", dir.display())
+                })?;
+                tracing::info!(
+                    upper_synth = %dir.display(),
+                    "no upperdir= passed; synthesized an empty upper for read-only overlay mount"
+                );
+                (dir.clone(), Some(dir))
+            }
+        };
 
         // Optional verity hints via env var.
         let verity_hints: std::collections::HashMap<PathBuf, (PathBuf, PathBuf)> =
