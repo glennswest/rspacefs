@@ -521,8 +521,11 @@ impl Filesystem for RspacefsFuse {
                 None => return reply.error(ENOENT),
             };
 
-            let needs_upper =
-                mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+            let needs_upper = mode.is_some()
+                || uid.is_some()
+                || gid.is_some()
+                || atime.is_some()
+                || mtime.is_some();
 
             // truncate(path, 0): clobber via the overlay so LayerFS sees it.
             if matches!(size, Some(0)) {
@@ -564,7 +567,11 @@ impl Filesystem for RspacefsFuse {
                     let g = gid.unwrap_or(u32::MAX);
                     let rc = unsafe { libc::lchown(c.as_ptr(), u, g) };
                     if rc != 0 {
-                        return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO));
+                        return reply.error(
+                            std::io::Error::last_os_error()
+                                .raw_os_error()
+                                .unwrap_or(EIO),
+                        );
                     }
                 }
 
@@ -1502,25 +1509,30 @@ fn copy_with_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Apply atime/mtime to `path` via `utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW)`.
 /// `None` slots are filled with UTIME_OMIT so they're preserved.
-fn apply_times(
-    path: &Path,
-    atime: Option<TimeOrNow>,
-    mtime: Option<TimeOrNow>,
-) -> Result<(), i32> {
+fn apply_times(path: &Path, atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>) -> Result<(), i32> {
     use std::os::unix::ffi::OsStrExt;
     const UTIME_OMIT: i64 = (1i64 << 30) - 2;
     const UTIME_NOW: i64 = (1i64 << 30) - 1;
 
     fn to_ts(t: Option<TimeOrNow>) -> libc::timespec {
         match t {
-            None => libc::timespec { tv_sec: 0, tv_nsec: UTIME_OMIT },
-            Some(TimeOrNow::Now) => libc::timespec { tv_sec: 0, tv_nsec: UTIME_NOW },
+            None => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            Some(TimeOrNow::Now) => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_NOW,
+            },
             Some(TimeOrNow::SpecificTime(st)) => match st.duration_since(UNIX_EPOCH) {
                 Ok(d) => libc::timespec {
                     tv_sec: d.as_secs() as libc::time_t,
                     tv_nsec: d.subsec_nanos() as i64,
                 },
-                Err(_) => libc::timespec { tv_sec: 0, tv_nsec: UTIME_OMIT },
+                Err(_) => libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_OMIT,
+                },
             },
         }
     }
@@ -1528,12 +1540,19 @@ fn apply_times(
     let times = [to_ts(atime), to_ts(mtime)];
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)?;
     let rc = unsafe {
-        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
     };
     if rc == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO))
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(EIO))
     }
 }
 
