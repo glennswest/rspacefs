@@ -159,7 +159,7 @@ mod linux_main {
         // `ro` at the VFS layer so writes never happen. Synthesize an
         // empty disposable tmpfs-style dir as the upper so LayerFS has
         // something to compose against. See issue #19.
-        let (upper, _upper_tmpdir): (PathBuf, Option<std::path::PathBuf>) = match upper {
+        let (upper, _upper_tmpdir_keep): (PathBuf, Option<std::path::PathBuf>) = match upper {
             Some(u) => (u, None),
             None => {
                 let pid = std::process::id();
@@ -244,9 +244,73 @@ mod linux_main {
         // shows up; the child detaches and runs the FUSE event loop forever.
         daemonize_after_mount(&mountpoint).context("daemonize")?;
 
-        fuser::mount2(fs, &mountpoint, &opts)
-            .context("FUSE mount failed (need /dev/fuse access?)")?;
-        Ok(())
+        // Hardening (#22 / #24): run the FUSE session inside a panic-catching
+        // shell so any unexpected panic in a handler doesn't drop us out
+        // without unmounting. On exit (clean or panic), force a lazy
+        // umount on the mountpoint so the kernel mount table doesn't leak
+        // a 'Transport endpoint is not connected' zombie. Also clean up
+        // the synthesized empty-upper tempdir if one was created.
+        let mp = mountpoint.clone();
+        let tmp_upper = _upper_tmpdir_keep.clone();
+        let session_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fuser::mount2(fs, &mountpoint, &opts)
+                .context("FUSE mount failed (need /dev/fuse access?)")
+        }));
+        cleanup_mount_on_exit(&mp, tmp_upper.as_deref());
+        match session_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(panic_payload) => {
+                let msg = panic_msg(panic_payload);
+                tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                bail!("FUSE session panicked: {msg}");
+            }
+        }
+    }
+
+    /// Lazy-unmount the FUSE mountpoint + remove the synthesized empty
+    /// upper tempdir (if any) on session exit. Always runs — clean exit,
+    /// kernel-initiated unmount, or panic.
+    ///
+    /// Why lazy: a regular umount(2) can fail with EBUSY if the kernel
+    /// hasn't fully released its references yet (e.g. another process
+    /// holds a stale handle). MNT_DETACH detaches the mount from the
+    /// filesystem hierarchy immediately and lets the kernel reap it
+    /// once the last reference drops. That eliminates the
+    /// 'Transport endpoint is not connected' zombie class.
+    fn cleanup_mount_on_exit(mountpoint: &std::path::Path, tmp_upper: Option<&std::path::Path>) {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(c) = std::ffi::CString::new(mountpoint.as_os_str().as_bytes()) {
+            // SAFETY: c is a valid C string; umount2 is a syscall wrapper.
+            let rc = unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+            if rc == 0 {
+                tracing::info!(mountpoint = %mountpoint.display(), "lazy-unmounted on session exit");
+            } else {
+                let errno = std::io::Error::last_os_error();
+                // EINVAL = mountpoint isn't mounted (already gone). Not an error.
+                // EPERM = no privileges. Caller is root for mount_program; warn.
+                tracing::debug!(
+                    mountpoint = %mountpoint.display(),
+                    error = %errno,
+                    "umount2 on exit returned non-zero (often EINVAL = already unmounted)"
+                );
+            }
+        }
+        if let Some(t) = tmp_upper {
+            let _ = std::fs::remove_dir_all(t);
+        }
+    }
+
+    /// Extract a printable message from a panic payload (the value
+    /// inside Box<dyn Any> that catch_unwind returns).
+    fn panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).into()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".into()
+        }
     }
 
     /// Fork the process. The parent polls the mountpoint until it sees a
@@ -679,13 +743,38 @@ mod linux_main {
                     notifier,
                 )
                 .context("failed to start control socket")?;
-                let res = session.run();
+                let mp = cli.mountpoint.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.run()));
                 let _ = std::fs::remove_file(sock_path);
-                res.context("FUSE session ended with error")?;
+                cleanup_mount_on_exit(&mp, None);
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        return Err(anyhow::Error::new(e).context("FUSE session ended with error"))
+                    }
+                    Err(p) => {
+                        let msg = panic_msg(p);
+                        tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                        anyhow::bail!("FUSE session panicked: {msg}");
+                    }
+                }
             }
             None => {
-                fuser::mount2(fs, &cli.mountpoint, &opts)
-                    .context("FUSE mount failed (need /dev/fuse access?)")?;
+                let mp = cli.mountpoint.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fuser::mount2(fs, &cli.mountpoint, &opts)
+                        .context("FUSE mount failed (need /dev/fuse access?)")
+                }));
+                cleanup_mount_on_exit(&mp, None);
+                match res {
+                    Ok(r) => r?,
+                    Err(p) => {
+                        let msg = panic_msg(p);
+                        tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                        anyhow::bail!("FUSE session panicked: {msg}");
+                    }
+                }
+                return Ok(());
             }
         }
         Ok(())

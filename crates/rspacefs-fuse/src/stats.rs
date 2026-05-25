@@ -50,6 +50,13 @@ pub struct Stats {
     pub errors_io: AtomicU64,
     pub errors_enoent: AtomicU64,
     pub errors_other: AtomicU64,
+    /// Hardening (#24): faults the daemon caught + recovered from
+    /// instead of crashing. Each class corresponds to one row in
+    /// `docs/faults.md`.
+    pub faults_panic: AtomicU64,
+    pub faults_session_retry: AtomicU64,
+    pub faults_lock_poisoned: AtomicU64,
+    pub faults_unexpected_errno: AtomicU64,
     /// Last op's millis-since-epoch. Useful as an "is this daemon alive
     /// and serving traffic?" liveness signal.
     pub last_op_unix_ms: AtomicU64,
@@ -136,6 +143,10 @@ impl Stats {
             errors_io: 0.into(),
             errors_enoent: 0.into(),
             errors_other: 0.into(),
+            faults_panic: 0.into(),
+            faults_session_retry: 0.into(),
+            faults_lock_poisoned: 0.into(),
+            faults_unexpected_errno: 0.into(),
             last_op_unix_ms: 0.into(),
             open_handles: 0.into(),
             recent: Mutex::new(RecentRing::new(128)),
