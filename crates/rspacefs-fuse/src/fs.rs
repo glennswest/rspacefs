@@ -412,6 +412,7 @@ impl Filesystem for RspacefsFuse {
     // ── Lookup / metadata ────────────────────────────────────────────────────
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _scope = self.stats.scope(Op::Lookup);
         self.stats.record(Op::Lookup, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -434,6 +435,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        let _scope = self.stats.scope(Op::Getattr);
         self.stats.record(Op::Getattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -463,6 +465,7 @@ impl Filesystem for RspacefsFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _scope = self.stats.scope(Op::Setattr);
         self.stats.record(Op::Setattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -539,6 +542,7 @@ impl Filesystem for RspacefsFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _scope = self.stats.scope(Op::Readdir);
         self.stats.record(Op::Readdir, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -607,6 +611,7 @@ impl Filesystem for RspacefsFuse {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _scope = self.stats.scope(Op::Mkdir);
         self.stats.record(Op::Mkdir, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -631,6 +636,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _scope = self.stats.scope(Op::Rmdir);
         self.stats.record(Op::Rmdir, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -662,6 +668,7 @@ impl Filesystem for RspacefsFuse {
     // ── Files ────────────────────────────────────────────────────────────────
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let _scope = self.stats.scope(Op::Open);
         self.stats.record(Op::Open, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -826,6 +833,7 @@ impl Filesystem for RspacefsFuse {
             OpenFile::Buffered { data, .. } => {
                 let start = offset as usize;
                 if start >= data.len() {
+                    let _scope = self.stats.scope(Op::Read);
                     self.stats.record(Op::Read, ino, 0, 0);
                     return reply.data(&[]);
                 }
@@ -890,6 +898,7 @@ impl Filesystem for RspacefsFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _scope = self.stats.scope(Op::Release);
         self.stats.record(Op::Release, ino, 0, 0);
         self.stats.open_handles.fetch_sub(1, Ordering::Relaxed);
         let Some(file) = self.open_files.remove(&fh) else {
@@ -930,6 +939,7 @@ impl Filesystem for RspacefsFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _scope = self.stats.scope(Op::Create);
         self.stats.record(Op::Create, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -977,6 +987,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _scope = self.stats.scope(Op::Unlink);
         self.stats.record(Op::Unlink, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -1011,6 +1022,7 @@ impl Filesystem for RspacefsFuse {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _scope = self.stats.scope(Op::Rename);
         self.stats.record(Op::Rename, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -1064,6 +1076,7 @@ impl Filesystem for RspacefsFuse {
     // ── Symlinks ────────────────────────────────────────────────────────────
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let _scope = self.stats.scope(Op::Readlink);
         self.stats.record(Op::Readlink, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1087,6 +1100,7 @@ impl Filesystem for RspacefsFuse {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let _scope = self.stats.scope(Op::Symlink);
         self.stats.record(Op::Symlink, parent, 0, 0);
         let parent_path = match self.path_of(parent) {
             Some(p) => p.to_string(),
@@ -1134,6 +1148,7 @@ impl Filesystem for RspacefsFuse {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        let _scope = self.stats.scope(Op::Getxattr);
         self.stats.record(Op::Getxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1159,6 +1174,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        let _scope = self.stats.scope(Op::Listxattr);
         self.stats.record(Op::Listxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1198,6 +1214,7 @@ impl Filesystem for RspacefsFuse {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let _scope = self.stats.scope(Op::Setxattr);
         self.stats.record(Op::Setxattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1215,6 +1232,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _scope = self.stats.scope(Op::Removexattr);
         self.stats.record(Op::Removexattr, ino, 0, 0);
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
@@ -1242,6 +1260,7 @@ impl Filesystem for RspacefsFuse {
         _flags: u32,
         reply: ReplyPoll,
     ) {
+        let _scope = self.stats.scope(Op::Poll);
         self.stats.record(Op::Poll, ino, 0, 0);
         // Regular files and directories on a plain filesystem are *always*
         // poll-ready in the POSIX sense — read() / write() don't block on
@@ -1258,6 +1277,7 @@ impl Filesystem for RspacefsFuse {
     // ── Durable writes ──────────────────────────────────────────────────────
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let _scope = self.stats.scope(Op::Fsync);
         self.stats.record(Op::Fsync, ino, 0, 0);
         // For Buffered (writable) handles: flush in-memory dirty data to
         // the upper file now. Streaming (read-only) handles have nothing
@@ -1299,6 +1319,7 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        let _scope = self.stats.scope(Op::Flush);
         self.stats.record(Op::Flush, ino, 0, 0);
         // Per POSIX: close() may flush; the kernel calls flush per close.
         // We do the actual write-back in release() to coalesce, so flush
@@ -1310,6 +1331,7 @@ impl Filesystem for RspacefsFuse {
     // ── Statfs ──────────────────────────────────────────────────────────────
 
     fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+        let _scope = self.stats.scope(Op::Statfs);
         self.stats.record(Op::Statfs, ino, 0, 0);
         // Synthesised — we don't know the underlying disk's real numbers
         // without poking the upper layer's backing filesystem. Report large

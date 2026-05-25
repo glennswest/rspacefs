@@ -22,14 +22,28 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+
+/// Latency-histogram bucket upper bounds in microseconds.
+///
+/// 16 finite buckets plus an implicit `+Inf` overflow tracked via `count -
+/// sum(buckets)`. Boundaries chosen so the steady-state hot path
+/// (passthrough open: ~10 µs, cached lookup: ~5 µs, copy-up: ~ms-range)
+/// each lands in a different bucket — gives meaningful p50 / p99
+/// resolution without per-op tail spew.
+pub const LAT_BUCKETS_US: &[u64] = &[
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000,
+];
+pub const LAT_N: usize = 16;
 
 /// Top-level counters and gauges. All atomic, all `Relaxed`.
 pub struct Stats {
     pub started_at: SystemTime,
     pub ops: OpCounters,
+    pub hists: OpHistograms,
     pub bytes_read: AtomicU64,
     pub bytes_written: AtomicU64,
     /// Open-file count broken down by handle kind.
@@ -64,6 +78,116 @@ pub struct Stats {
     pub open_handles: AtomicI64,
     /// Ring buffer of recent ops for the `ops` view.
     recent: Mutex<RecentRing>,
+}
+
+/// Latency histogram for one FUSE op. 16 atomic counters (one per bucket
+/// in `LAT_BUCKETS_US`) plus `count` (total observations including
+/// over-the-last-bucket) and `sum_us` (sum of observed latencies). All
+/// `Relaxed` — Prometheus quantile semantics tolerate per-observation
+/// reorderings; we only need the histogram to converge.
+pub struct LatHist {
+    pub buckets: [AtomicU64; LAT_N],
+    pub count: AtomicU64,
+    pub sum_us: AtomicU64,
+    pub in_flight: AtomicI64,
+}
+
+impl LatHist {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: 0.into(),
+            sum_us: 0.into(),
+            in_flight: 0.into(),
+        }
+    }
+
+    /// Record one observation. `us` is the latency in microseconds.
+    pub fn observe(&self, us: u64) {
+        for (i, &b) in LAT_BUCKETS_US.iter().enumerate() {
+            if us <= b {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LatHistSnapshot {
+        LatHistSnapshot {
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+            count: self.count.load(Ordering::Relaxed),
+            sum_us: self.sum_us.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct LatHistSnapshot {
+    pub buckets: [u64; LAT_N],
+    pub count: u64,
+    pub sum_us: u64,
+    pub in_flight: i64,
+}
+
+/// Per-op latency histograms, one per FUSE op. Same field layout as
+/// `OpCounters` so a future macro could collapse both.
+pub struct OpHistograms {
+    pub lookup: LatHist,
+    pub getattr: LatHist,
+    pub setattr: LatHist,
+    pub readdir: LatHist,
+    pub mkdir: LatHist,
+    pub rmdir: LatHist,
+    pub open: LatHist,
+    pub read: LatHist,
+    pub write: LatHist,
+    pub release: LatHist,
+    pub create: LatHist,
+    pub unlink: LatHist,
+    pub rename: LatHist,
+    pub readlink: LatHist,
+    pub symlink: LatHist,
+    pub getxattr: LatHist,
+    pub listxattr: LatHist,
+    pub setxattr: LatHist,
+    pub removexattr: LatHist,
+    pub fsync: LatHist,
+    pub flush: LatHist,
+    pub statfs: LatHist,
+    pub poll: LatHist,
+}
+
+impl OpHistograms {
+    fn new() -> Self {
+        Self {
+            lookup: LatHist::new(),
+            getattr: LatHist::new(),
+            setattr: LatHist::new(),
+            readdir: LatHist::new(),
+            mkdir: LatHist::new(),
+            rmdir: LatHist::new(),
+            open: LatHist::new(),
+            read: LatHist::new(),
+            write: LatHist::new(),
+            release: LatHist::new(),
+            create: LatHist::new(),
+            unlink: LatHist::new(),
+            rename: LatHist::new(),
+            readlink: LatHist::new(),
+            symlink: LatHist::new(),
+            getxattr: LatHist::new(),
+            listxattr: LatHist::new(),
+            setxattr: LatHist::new(),
+            removexattr: LatHist::new(),
+            fsync: LatHist::new(),
+            flush: LatHist::new(),
+            statfs: LatHist::new(),
+            poll: LatHist::new(),
+        }
+    }
 }
 
 /// Per-op-kind counter set. Numbers match the FUSE op names exactly so
@@ -129,6 +253,7 @@ impl Stats {
         Self {
             started_at: SystemTime::now(),
             ops: OpCounters::new(),
+            hists: OpHistograms::new(),
             bytes_read: 0.into(),
             bytes_written: 0.into(),
             passthrough_opens: 0.into(),
@@ -197,6 +322,31 @@ impl Stats {
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             uptime_secs: self.started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+            hists: HistSnapshot {
+                lookup: self.hists.lookup.snapshot(),
+                getattr: self.hists.getattr.snapshot(),
+                setattr: self.hists.setattr.snapshot(),
+                readdir: self.hists.readdir.snapshot(),
+                mkdir: self.hists.mkdir.snapshot(),
+                rmdir: self.hists.rmdir.snapshot(),
+                open: self.hists.open.snapshot(),
+                read: self.hists.read.snapshot(),
+                write: self.hists.write.snapshot(),
+                release: self.hists.release.snapshot(),
+                create: self.hists.create.snapshot(),
+                unlink: self.hists.unlink.snapshot(),
+                rename: self.hists.rename.snapshot(),
+                readlink: self.hists.readlink.snapshot(),
+                symlink: self.hists.symlink.snapshot(),
+                getxattr: self.hists.getxattr.snapshot(),
+                listxattr: self.hists.listxattr.snapshot(),
+                setxattr: self.hists.setxattr.snapshot(),
+                removexattr: self.hists.removexattr.snapshot(),
+                fsync: self.hists.fsync.snapshot(),
+                flush: self.hists.flush.snapshot(),
+                statfs: self.hists.statfs.snapshot(),
+                poll: self.hists.poll.snapshot(),
+            },
             ops: OpSnapshot {
                 lookup: self.ops.lookup.load(Ordering::Relaxed),
                 getattr: self.ops.getattr.load(Ordering::Relaxed),
@@ -248,6 +398,46 @@ impl Stats {
             .unwrap_or_default()
     }
 
+    /// Start timing one op. Returned guard increments in-flight on
+    /// construction and, on drop, records the elapsed latency into the
+    /// per-op histogram + decrements in-flight.
+    pub fn scope(&self, op: Op) -> OpScope<'_> {
+        self.hist_for(op).in_flight.fetch_add(1, Ordering::Relaxed);
+        OpScope {
+            stats: self,
+            op,
+            started: Instant::now(),
+        }
+    }
+
+    pub fn hist_for(&self, op: Op) -> &LatHist {
+        match op {
+            Op::Lookup => &self.hists.lookup,
+            Op::Getattr => &self.hists.getattr,
+            Op::Setattr => &self.hists.setattr,
+            Op::Readdir => &self.hists.readdir,
+            Op::Mkdir => &self.hists.mkdir,
+            Op::Rmdir => &self.hists.rmdir,
+            Op::Open => &self.hists.open,
+            Op::Read => &self.hists.read,
+            Op::Write => &self.hists.write,
+            Op::Release => &self.hists.release,
+            Op::Create => &self.hists.create,
+            Op::Unlink => &self.hists.unlink,
+            Op::Rename => &self.hists.rename,
+            Op::Readlink => &self.hists.readlink,
+            Op::Symlink => &self.hists.symlink,
+            Op::Getxattr => &self.hists.getxattr,
+            Op::Listxattr => &self.hists.listxattr,
+            Op::Setxattr => &self.hists.setxattr,
+            Op::Removexattr => &self.hists.removexattr,
+            Op::Fsync => &self.hists.fsync,
+            Op::Flush => &self.hists.flush,
+            Op::Statfs => &self.hists.statfs,
+            Op::Poll => &self.hists.poll,
+        }
+    }
+
     fn counter_for(&self, op: Op) -> &AtomicU64 {
         match op {
             Op::Lookup => &self.ops.lookup,
@@ -274,6 +464,25 @@ impl Stats {
             Op::Statfs => &self.ops.statfs,
             Op::Poll => &self.ops.poll,
         }
+    }
+}
+
+/// RAII guard returned by `Stats::scope`. Increments in-flight on
+/// construction and on drop records the elapsed latency into the per-op
+/// histogram + decrements in-flight. One line at the top of each FUSE op
+/// method is all that's needed.
+pub struct OpScope<'a> {
+    stats: &'a Stats,
+    op: Op,
+    started: Instant,
+}
+
+impl<'a> Drop for OpScope<'a> {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        let h = self.stats.hist_for(self.op);
+        h.observe(elapsed_us);
+        h.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -359,8 +568,36 @@ impl RecentRing {
 }
 
 #[derive(Serialize)]
+pub struct HistSnapshot {
+    pub lookup: LatHistSnapshot,
+    pub getattr: LatHistSnapshot,
+    pub setattr: LatHistSnapshot,
+    pub readdir: LatHistSnapshot,
+    pub mkdir: LatHistSnapshot,
+    pub rmdir: LatHistSnapshot,
+    pub open: LatHistSnapshot,
+    pub read: LatHistSnapshot,
+    pub write: LatHistSnapshot,
+    pub release: LatHistSnapshot,
+    pub create: LatHistSnapshot,
+    pub unlink: LatHistSnapshot,
+    pub rename: LatHistSnapshot,
+    pub readlink: LatHistSnapshot,
+    pub symlink: LatHistSnapshot,
+    pub getxattr: LatHistSnapshot,
+    pub listxattr: LatHistSnapshot,
+    pub setxattr: LatHistSnapshot,
+    pub removexattr: LatHistSnapshot,
+    pub fsync: LatHistSnapshot,
+    pub flush: LatHistSnapshot,
+    pub statfs: LatHistSnapshot,
+    pub poll: LatHistSnapshot,
+}
+
+#[derive(Serialize)]
 pub struct StatsSnapshot {
     pub uptime_secs: u64,
+    pub hists: HistSnapshot,
     pub ops: OpSnapshot,
     pub bytes_read: u64,
     pub bytes_written: u64,
@@ -547,6 +784,66 @@ pub fn render_prom(snap: &StatsSnapshot, mountpoint: &str) -> String {
         snap.last_op_unix_ms,
         "epoch-ms timestamp of the last op (liveness)"
     );
+
+    // ── Latency histograms + in-flight gauges ─────────────────────────────
+    out.push_str("# HELP rspacefs_op_latency_microseconds Per-op latency distribution\n");
+    out.push_str("# TYPE rspacefs_op_latency_microseconds histogram\n");
+    out.push_str("# HELP rspacefs_op_in_flight Currently-executing op count by op\n");
+    out.push_str("# TYPE rspacefs_op_in_flight gauge\n");
+
+    let hist_entries: [(&str, &LatHistSnapshot); 23] = [
+        ("lookup", &snap.hists.lookup),
+        ("getattr", &snap.hists.getattr),
+        ("setattr", &snap.hists.setattr),
+        ("readdir", &snap.hists.readdir),
+        ("mkdir", &snap.hists.mkdir),
+        ("rmdir", &snap.hists.rmdir),
+        ("open", &snap.hists.open),
+        ("read", &snap.hists.read),
+        ("write", &snap.hists.write),
+        ("release", &snap.hists.release),
+        ("create", &snap.hists.create),
+        ("unlink", &snap.hists.unlink),
+        ("rename", &snap.hists.rename),
+        ("readlink", &snap.hists.readlink),
+        ("symlink", &snap.hists.symlink),
+        ("getxattr", &snap.hists.getxattr),
+        ("listxattr", &snap.hists.listxattr),
+        ("setxattr", &snap.hists.setxattr),
+        ("removexattr", &snap.hists.removexattr),
+        ("fsync", &snap.hists.fsync),
+        ("flush", &snap.hists.flush),
+        ("statfs", &snap.hists.statfs),
+        ("poll", &snap.hists.poll),
+    ];
+    for (op_name, h) in hist_entries {
+        // Prometheus histograms are cumulative — each bucket reports
+        // count <= le. We track per-bucket non-cumulative; sum here.
+        let mut cumulative: u64 = 0;
+        for (i, &bound) in LAT_BUCKETS_US.iter().enumerate() {
+            cumulative += h.buckets[i];
+            out.push_str(&format!(
+                "rspacefs_op_latency_microseconds_bucket{{mount=\"{}\",op=\"{}\",le=\"{}\"}} {}\n",
+                m, op_name, bound, cumulative
+            ));
+        }
+        out.push_str(&format!(
+            "rspacefs_op_latency_microseconds_bucket{{mount=\"{}\",op=\"{}\",le=\"+Inf\"}} {}\n",
+            m, op_name, h.count
+        ));
+        out.push_str(&format!(
+            "rspacefs_op_latency_microseconds_count{{mount=\"{}\",op=\"{}\"}} {}\n",
+            m, op_name, h.count
+        ));
+        out.push_str(&format!(
+            "rspacefs_op_latency_microseconds_sum{{mount=\"{}\",op=\"{}\"}} {}\n",
+            m, op_name, h.sum_us
+        ));
+        out.push_str(&format!(
+            "rspacefs_op_in_flight{{mount=\"{}\",op=\"{}\"}} {}\n",
+            m, op_name, h.in_flight
+        ));
+    }
     out
 }
 
@@ -555,4 +852,67 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lat_hist_records_in_correct_bucket() {
+        let h = LatHist::new();
+        h.observe(40);       // bucket 0 (<=50us)
+        h.observe(75);       // bucket 1 (<=100us)
+        h.observe(75);       // bucket 1
+        h.observe(900);      // bucket 4 (<=1000us)
+        h.observe(10_000_000); // beyond last bucket — count++ sum++, no bucket
+        let s = h.snapshot();
+        assert_eq!(s.buckets[0], 1);
+        assert_eq!(s.buckets[1], 2);
+        assert_eq!(s.buckets[2], 0);
+        assert_eq!(s.buckets[3], 0);
+        assert_eq!(s.buckets[4], 1);
+        assert_eq!(s.count, 5);
+        assert_eq!(s.sum_us, 40 + 75 + 75 + 900 + 10_000_000);
+    }
+
+    #[test]
+    fn op_scope_increments_and_decrements_in_flight() {
+        let s = Stats::new();
+        assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 0);
+        {
+            let _scope = s.scope(Op::Lookup);
+            assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 0);
+        // Drop should also have recorded one observation.
+        assert_eq!(s.hists.lookup.count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nested_scopes_dont_corrupt_in_flight() {
+        let s = Stats::new();
+        let scope_a = s.scope(Op::Read);
+        let scope_b = s.scope(Op::Read);
+        assert_eq!(s.hists.read.in_flight.load(Ordering::Relaxed), 2);
+        drop(scope_b);
+        assert_eq!(s.hists.read.in_flight.load(Ordering::Relaxed), 1);
+        drop(scope_a);
+        assert_eq!(s.hists.read.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prom_emits_cumulative_buckets_and_in_flight() {
+        let s = Stats::new();
+        s.hists.lookup.observe(40);
+        s.hists.lookup.observe(900);
+        let snap = s.snapshot();
+        let out = render_prom(&snap, "/mnt/test");
+        // Cumulative: bucket le=50 has 1, le=1000 has 2, +Inf has 2.
+        assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"50\"} 1"));
+        assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"1000\"} 2"));
+        assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"+Inf\"} 2"));
+        assert!(out.contains("rspacefs_op_latency_microseconds_count{mount=\"/mnt/test\",op=\"lookup\"} 2"));
+        assert!(out.contains("rspacefs_op_in_flight{mount=\"/mnt/test\",op=\"lookup\"} 0"));
+    }
 }
