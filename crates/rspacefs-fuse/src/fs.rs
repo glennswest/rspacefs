@@ -449,12 +449,12 @@ impl Filesystem for RspacefsFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -464,13 +464,15 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyAttr,
     ) {
         self.stats.record(Op::Setattr, ino, 0, 0);
-        // We support the only setattr op containers actually rely on:
-        // `truncate(path, 0)` to clobber a file. Everything else returns the
-        // current attrs unchanged (kernel still sees a successful chmod, etc.)
         let path = match self.path_of(ino) {
             Some(p) => p.to_string(),
             None => return reply.error(ENOENT),
         };
+
+        let needs_upper =
+            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+
+        // truncate(path, 0): clobber via the overlay so LayerFS sees it.
         if matches!(size, Some(0)) {
             let p = match self.root.join(&path) {
                 Ok(v) => v,
@@ -480,6 +482,47 @@ impl Filesystem for RspacefsFuse {
                 return reply.error(EIO);
             }
         }
+
+        if needs_upper {
+            // chmod / chown / utimens must hit the real upper file. Copy up
+            // first if the inode still lives in a lower layer.
+            let upper = match self.ensure_in_upper(&path) {
+                Ok(p) => p,
+                Err(errno) => return reply.error(errno),
+            };
+
+            if let Some(m) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                // Strip file-type bits — only permission bits should pass to
+                // set_permissions(); the type is fixed by the inode.
+                let perms = std::fs::Permissions::from_mode(m & 0o7777);
+                if let Err(e) = std::fs::set_permissions(&upper, perms) {
+                    return reply.error(e.raw_os_error().unwrap_or(EIO));
+                }
+            }
+
+            if uid.is_some() || gid.is_some() {
+                // lchown via libc — preserves symlinks, doesn't dereference.
+                use std::os::unix::ffi::OsStrExt;
+                let c = match std::ffi::CString::new(upper.as_os_str().as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => return reply.error(EINVAL),
+                };
+                let u = uid.unwrap_or(u32::MAX); // -1 = leave unchanged
+                let g = gid.unwrap_or(u32::MAX);
+                let rc = unsafe { libc::lchown(c.as_ptr(), u, g) };
+                if rc != 0 {
+                    return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO));
+                }
+            }
+
+            if atime.is_some() || mtime.is_some() {
+                if let Err(errno) = apply_times(&upper, atime, mtime) {
+                    return reply.error(errno);
+                }
+            }
+        }
+
         match self.attr_for_path(ino, &path) {
             Some(a) => reply.attr(&TTL, &a),
             None => reply.error(ENOENT),
@@ -1342,6 +1385,43 @@ fn copy_with_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(dst);
     std::fs::copy(src, dst)?;
     Ok(())
+}
+
+/// Apply atime/mtime to `path` via `utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW)`.
+/// `None` slots are filled with UTIME_OMIT so they're preserved.
+fn apply_times(
+    path: &Path,
+    atime: Option<TimeOrNow>,
+    mtime: Option<TimeOrNow>,
+) -> Result<(), i32> {
+    use std::os::unix::ffi::OsStrExt;
+    const UTIME_OMIT: i64 = (1i64 << 30) - 2;
+    const UTIME_NOW: i64 = (1i64 << 30) - 1;
+
+    fn to_ts(t: Option<TimeOrNow>) -> libc::timespec {
+        match t {
+            None => libc::timespec { tv_sec: 0, tv_nsec: UTIME_OMIT },
+            Some(TimeOrNow::Now) => libc::timespec { tv_sec: 0, tv_nsec: UTIME_NOW },
+            Some(TimeOrNow::SpecificTime(st)) => match st.duration_since(UNIX_EPOCH) {
+                Ok(d) => libc::timespec {
+                    tv_sec: d.as_secs() as libc::time_t,
+                    tv_nsec: d.subsec_nanos() as i64,
+                },
+                Err(_) => libc::timespec { tv_sec: 0, tv_nsec: UTIME_OMIT },
+            },
+        }
+    }
+
+    let times = [to_ts(atime), to_ts(mtime)];
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| EINVAL)?;
+    let rc = unsafe {
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO))
+    }
 }
 
 // Silence unused-import warnings on uncommon configurations.

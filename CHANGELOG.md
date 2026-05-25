@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 2026-05-24
+- **fix (fuse):** `setattr` now honors `mode`, `uid`, `gid`, `atime`, `mtime` instead of silently accepting and discarding them. Implementation copies the target up into the writable upper (via the existing `ensure_in_upper`), then applies each requested attribute against the real upper file: `std::fs::set_permissions` for mode (mask `0o7777`), `libc::lchown` for uid/gid (so symlinks aren't dereferenced), `libc::utimensat(AT_SYMLINK_NOFOLLOW)` for times (with `UTIME_OMIT` for unset slots). Closes [#20](https://github.com/glennswest/rspacefs/issues/20). Prior to this, `chmod 0755` through a FUSE mount returned success but left the file at the kernel-default mode (commonly 0644) — buildah COPY would write a binary then chmod it, and the chmod silently lost. Now the round-trip preserves the exec bit. Symlinks created via `symlink(2)` on the FUSE mount were already persisted correctly; verified the `make_attr` path reads `symlink_metadata` first so the kernel sees `S_IFLNK` on lookup.
+
 ### 2026-05-23
 - **feat (fuse):** Control protocol expanded — `stats` (JSON counter snapshot), `metrics-text` (Prometheus text), `info` (config + pid + version), `ops` (recent FUSE op ring), `debug` (open handles, RSS, last-op, layer count). `ControlState` now carries `Arc<Stats>` so reads don't touch the FS.
 - **feat (cli):** `rspacefs ctl --socket PATH ...` gains `stats`, `metrics`, `info`, `ops [--n N]`, `debug` subcommands. `metrics` strips the JSON envelope so output is valid Prometheus exposition text.
