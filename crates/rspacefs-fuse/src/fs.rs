@@ -378,6 +378,50 @@ impl RspacefsFuse {
 // Internal helpers that work on owned/short-lived locals only — keeps
 // borrow-checker noise out of each Filesystem method.
 
+/// Extract a printable message from a panic payload returned by
+/// `std::panic::catch_unwind`. Matches the contract of canonical `panic!`
+/// payloads: `&'static str` (literal-arg case) or `String` (format-arg
+/// case); everything else surfaces as a placeholder so we never lose the
+/// fault record — just the message text.
+pub fn panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).into()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".into()
+    }
+}
+
+/// Per-op panic guard for the FUSE adapter. Wraps a method body in
+/// `catch_unwind`; on panic, bumps `faults_panic`, emits a structured
+/// fault event (journald + dmesg via `crate::fault`), and lets the
+/// dropped `reply` fall through to fuser's default ENOSYS response.
+///
+/// This is the load-bearing piece of #24: one bug in a single FUSE op
+/// handler stays contained — the session loop survives, the kernel mount
+/// stays connected, and every other container using the mount keeps
+/// running. Without this, a panic in any op turns the mount into
+/// `Transport endpoint is not connected` for every consumer on the host.
+#[macro_export]
+macro_rules! protect {
+    ($self:ident, $op:literal, $body:block) => {{
+        let _stats = std::sync::Arc::clone(&$self.stats);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body));
+        if let Err(p) = result {
+            let msg = $crate::fs::panic_msg(p);
+            _stats
+                .faults_panic
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            $crate::fault(
+                $crate::kmsg::Prio::Err,
+                "op_panic",
+                &format!("op={} panic={}", $op, msg),
+            );
+        }
+    }};
+}
+
 impl Filesystem for RspacefsFuse {
     // ── Init handshake ──────────────────────────────────────────────────────
 
@@ -413,38 +457,42 @@ impl Filesystem for RspacefsFuse {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let _scope = self.stats.scope(Op::Lookup);
-        self.stats.record(Op::Lookup, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
+        crate::protect!(self, "lookup", {
+            self.stats.record(Op::Lookup, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
 
-        // Use the physical side-channel directly so symlinks are reported
-        // AS symlinks (vfs follows them; FUSE consumers expect them raw).
-        if self.physical_for(&path).is_none() {
-            return reply.error(ENOENT);
-        }
+            // Use the physical side-channel directly so symlinks are reported
+            // AS symlinks (vfs follows them; FUSE consumers expect them raw).
+            if self.physical_for(&path).is_none() {
+                return reply.error(ENOENT);
+            }
 
-        let ino = self.intern_path(path.clone());
-        // ft/size args ignored when physical_for succeeds (which we just verified).
-        let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
-        reply.entry(&TTL, &attr, 0);
+            let ino = self.intern_path(path.clone());
+            // ft/size args ignored when physical_for succeeds (which we just verified).
+            let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
+            reply.entry(&TTL, &attr, 0);
+        });
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let _scope = self.stats.scope(Op::Getattr);
-        self.stats.record(Op::Getattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        match self.attr_for_path(ino, &path) {
-            Some(a) => reply.attr(&TTL, &a),
-            None => reply.error(ENOENT),
-        }
+        crate::protect!(self, "getattr", {
+            self.stats.record(Op::Getattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            match self.attr_for_path(ino, &path) {
+                Some(a) => reply.attr(&TTL, &a),
+                None => reply.error(ENOENT),
+            }
+        });
     }
 
     fn setattr(
@@ -466,70 +514,72 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyAttr,
     ) {
         let _scope = self.stats.scope(Op::Setattr);
-        self.stats.record(Op::Setattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-
-        let needs_upper =
-            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
-
-        // truncate(path, 0): clobber via the overlay so LayerFS sees it.
-        if matches!(size, Some(0)) {
-            let p = match self.root.join(&path) {
-                Ok(v) => v,
-                Err(_) => return reply.error(EIO),
-            };
-            if p.create_file().is_err() {
-                return reply.error(EIO);
-            }
-        }
-
-        if needs_upper {
-            // chmod / chown / utimens must hit the real upper file. Copy up
-            // first if the inode still lives in a lower layer.
-            let upper = match self.ensure_in_upper(&path) {
-                Ok(p) => p,
-                Err(errno) => return reply.error(errno),
+        crate::protect!(self, "setattr", {
+            self.stats.record(Op::Setattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
             };
 
-            if let Some(m) = mode {
-                use std::os::unix::fs::PermissionsExt;
-                // Strip file-type bits — only permission bits should pass to
-                // set_permissions(); the type is fixed by the inode.
-                let perms = std::fs::Permissions::from_mode(m & 0o7777);
-                if let Err(e) = std::fs::set_permissions(&upper, perms) {
-                    return reply.error(e.raw_os_error().unwrap_or(EIO));
-                }
-            }
+            let needs_upper =
+                mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
 
-            if uid.is_some() || gid.is_some() {
-                // lchown via libc — preserves symlinks, doesn't dereference.
-                use std::os::unix::ffi::OsStrExt;
-                let c = match std::ffi::CString::new(upper.as_os_str().as_bytes()) {
+            // truncate(path, 0): clobber via the overlay so LayerFS sees it.
+            if matches!(size, Some(0)) {
+                let p = match self.root.join(&path) {
                     Ok(v) => v,
-                    Err(_) => return reply.error(EINVAL),
+                    Err(_) => return reply.error(EIO),
                 };
-                let u = uid.unwrap_or(u32::MAX); // -1 = leave unchanged
-                let g = gid.unwrap_or(u32::MAX);
-                let rc = unsafe { libc::lchown(c.as_ptr(), u, g) };
-                if rc != 0 {
-                    return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO));
+                if p.create_file().is_err() {
+                    return reply.error(EIO);
                 }
             }
 
-            if atime.is_some() || mtime.is_some() {
-                if let Err(errno) = apply_times(&upper, atime, mtime) {
-                    return reply.error(errno);
+            if needs_upper {
+                // chmod / chown / utimens must hit the real upper file. Copy up
+                // first if the inode still lives in a lower layer.
+                let upper = match self.ensure_in_upper(&path) {
+                    Ok(p) => p,
+                    Err(errno) => return reply.error(errno),
+                };
+
+                if let Some(m) = mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    // Strip file-type bits — only permission bits should pass to
+                    // set_permissions(); the type is fixed by the inode.
+                    let perms = std::fs::Permissions::from_mode(m & 0o7777);
+                    if let Err(e) = std::fs::set_permissions(&upper, perms) {
+                        return reply.error(e.raw_os_error().unwrap_or(EIO));
+                    }
+                }
+
+                if uid.is_some() || gid.is_some() {
+                    // lchown via libc — preserves symlinks, doesn't dereference.
+                    use std::os::unix::ffi::OsStrExt;
+                    let c = match std::ffi::CString::new(upper.as_os_str().as_bytes()) {
+                        Ok(v) => v,
+                        Err(_) => return reply.error(EINVAL),
+                    };
+                    let u = uid.unwrap_or(u32::MAX); // -1 = leave unchanged
+                    let g = gid.unwrap_or(u32::MAX);
+                    let rc = unsafe { libc::lchown(c.as_ptr(), u, g) };
+                    if rc != 0 {
+                        return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(EIO));
+                    }
+                }
+
+                if atime.is_some() || mtime.is_some() {
+                    if let Err(errno) = apply_times(&upper, atime, mtime) {
+                        return reply.error(errno);
+                    }
                 }
             }
-        }
 
-        match self.attr_for_path(ino, &path) {
-            Some(a) => reply.attr(&TTL, &a),
-            None => reply.error(ENOENT),
-        }
+            match self.attr_for_path(ino, &path) {
+                Some(a) => reply.attr(&TTL, &a),
+                None => reply.error(ENOENT),
+            }
+        });
     }
 
     // ── Directories ──────────────────────────────────────────────────────────
@@ -543,63 +593,65 @@ impl Filesystem for RspacefsFuse {
         mut reply: ReplyDirectory,
     ) {
         let _scope = self.stats.scope(Op::Readdir);
-        self.stats.record(Op::Readdir, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let dir = match self.root.join(&path) {
-            Ok(d) => d,
-            Err(_) => return reply.error(EIO),
-        };
-        let entries: Vec<String> = match dir.read_dir() {
-            Ok(it) => it.map(|e| e.filename()).collect(),
-            Err(_) => return reply.error(EIO),
-        };
-
-        // Synthesize ".", ".." plus the directory contents.
-        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
-        all.push((ino, FileType::Directory, ".".to_string()));
-        // ".." inode: cheap approximation — root's parent is root.
-        let parent_ino = if ino == ROOT_INO {
-            ROOT_INO
-        } else {
-            let parent_path = match path.rfind('/') {
-                Some(i) => &path[..i],
-                None => "",
+        crate::protect!(self, "readdir", {
+            self.stats.record(Op::Readdir, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
             };
-            *self.paths.get(parent_path).unwrap_or(&ROOT_INO)
-        };
-        all.push((parent_ino, FileType::Directory, "..".to_string()));
+            let dir = match self.root.join(&path) {
+                Ok(d) => d,
+                Err(_) => return reply.error(EIO),
+            };
+            let entries: Vec<String> = match dir.read_dir() {
+                Ok(it) => it.map(|e| e.filename()).collect(),
+                Err(_) => return reply.error(EIO),
+            };
 
-        for name in entries {
-            let child_path = if path.is_empty() {
-                name.clone()
+            // Synthesize ".", ".." plus the directory contents.
+            let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
+            all.push((ino, FileType::Directory, ".".to_string()));
+            // ".." inode: cheap approximation — root's parent is root.
+            let parent_ino = if ino == ROOT_INO {
+                ROOT_INO
             } else {
-                format!("{}/{}", path, name)
+                let parent_path = match path.rfind('/') {
+                    Some(i) => &path[..i],
+                    None => "",
+                };
+                *self.paths.get(parent_path).unwrap_or(&ROOT_INO)
             };
-            // Determine the entry kind via physical symlink_metadata so symlinks
-            // show as symlinks (not as their targets).
-            let kind = match self
-                .physical_for(&child_path)
-                .and_then(|p| p.symlink_metadata().ok())
-            {
-                Some(m) if m.file_type().is_dir() => FileType::Directory,
-                Some(m) if m.file_type().is_symlink() => FileType::Symlink,
-                Some(_) => FileType::RegularFile,
-                None => FileType::RegularFile,
-            };
-            let child_ino = self.intern_path(child_path);
-            all.push((child_ino, kind, name));
-        }
+            all.push((parent_ino, FileType::Directory, "..".to_string()));
 
-        for (i, (e_ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            // `add` returns true if the buffer is full.
-            if reply.add(e_ino, (i + 1) as i64, kind, &name) {
-                break;
+            for name in entries {
+                let child_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", path, name)
+                };
+                // Determine the entry kind via physical symlink_metadata so symlinks
+                // show as symlinks (not as their targets).
+                let kind = match self
+                    .physical_for(&child_path)
+                    .and_then(|p| p.symlink_metadata().ok())
+                {
+                    Some(m) if m.file_type().is_dir() => FileType::Directory,
+                    Some(m) if m.file_type().is_symlink() => FileType::Symlink,
+                    Some(_) => FileType::RegularFile,
+                    None => FileType::RegularFile,
+                };
+                let child_ino = self.intern_path(child_path);
+                all.push((child_ino, kind, name));
             }
-        }
-        reply.ok();
+
+            for (i, (e_ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
+                // `add` returns true if the buffer is full.
+                if reply.add(e_ino, (i + 1) as i64, kind, &name) {
+                    break;
+                }
+            }
+            reply.ok();
+        });
     }
 
     fn mkdir(
@@ -612,57 +664,61 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEntry,
     ) {
         let _scope = self.stats.scope(Op::Mkdir);
-        self.stats.record(Op::Mkdir, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        if p.exists().unwrap_or(false) {
-            return reply.error(EEXIST);
-        }
-        if p.create_dir().is_err() {
-            return reply.error(EIO);
-        }
-        let ino = self.intern_path(path.clone());
-        let attr = self.make_attr(ino, &path, VfsFileType::Directory, 0);
-        reply.entry(&TTL, &attr, 0);
+        crate::protect!(self, "mkdir", {
+            self.stats.record(Op::Mkdir, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
+            let p = match self.root.join(&path) {
+                Ok(v) => v,
+                Err(_) => return reply.error(EIO),
+            };
+            if p.exists().unwrap_or(false) {
+                return reply.error(EEXIST);
+            }
+            if p.create_dir().is_err() {
+                return reply.error(EIO);
+            }
+            let ino = self.intern_path(path.clone());
+            let attr = self.make_attr(ino, &path, VfsFileType::Directory, 0);
+            reply.entry(&TTL, &attr, 0);
+        });
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let _scope = self.stats.scope(Op::Rmdir);
-        self.stats.record(Op::Rmdir, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        // Empty-dir check: ENOTEMPTY if the directory has any entries.
-        if let Ok(mut it) = p.read_dir() {
-            if it.next().is_some() {
-                return reply.error(ENOTEMPTY);
+        crate::protect!(self, "rmdir", {
+            self.stats.record(Op::Rmdir, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
+            let p = match self.root.join(&path) {
+                Ok(v) => v,
+                Err(_) => return reply.error(EIO),
+            };
+            // Empty-dir check: ENOTEMPTY if the directory has any entries.
+            if let Ok(mut it) = p.read_dir() {
+                if it.next().is_some() {
+                    return reply.error(ENOTEMPTY);
+                }
             }
-        }
-        if p.remove_dir().is_err() {
-            return reply.error(EIO);
-        }
-        // Drop the inode binding — kernel forgets soon afterwards.
-        if let Some(ino) = self.paths.remove(&path) {
-            self.inodes.remove(&ino);
-        }
-        reply.ok();
+            if p.remove_dir().is_err() {
+                return reply.error(EIO);
+            }
+            // Drop the inode binding — kernel forgets soon afterwards.
+            if let Some(ino) = self.paths.remove(&path) {
+                self.inodes.remove(&ino);
+            }
+            reply.ok();
+        });
     }
 
     // ── Files ────────────────────────────────────────────────────────────────
@@ -801,6 +857,7 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _scope = self.stats.scope(Op::Read);
         let Some(file) = self.open_files.get_mut(&fh) else {
             self.stats.record(Op::Read, ino, 0, EBADF);
             return reply.error(EBADF);

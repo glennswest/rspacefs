@@ -861,10 +861,10 @@ mod tests {
     #[test]
     fn lat_hist_records_in_correct_bucket() {
         let h = LatHist::new();
-        h.observe(40);       // bucket 0 (<=50us)
-        h.observe(75);       // bucket 1 (<=100us)
-        h.observe(75);       // bucket 1
-        h.observe(900);      // bucket 4 (<=1000us)
+        h.observe(40); // bucket 0 (<=50us)
+        h.observe(75); // bucket 1 (<=100us)
+        h.observe(75); // bucket 1
+        h.observe(900); // bucket 4 (<=1000us)
         h.observe(10_000_000); // beyond last bucket — count++ sum++, no bucket
         let s = h.snapshot();
         assert_eq!(s.buckets[0], 1);
@@ -912,7 +912,9 @@ mod tests {
         assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"50\"} 1"));
         assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"1000\"} 2"));
         assert!(out.contains("rspacefs_op_latency_microseconds_bucket{mount=\"/mnt/test\",op=\"lookup\",le=\"+Inf\"} 2"));
-        assert!(out.contains("rspacefs_op_latency_microseconds_count{mount=\"/mnt/test\",op=\"lookup\"} 2"));
+        assert!(out.contains(
+            "rspacefs_op_latency_microseconds_count{mount=\"/mnt/test\",op=\"lookup\"} 2"
+        ));
         assert!(out.contains("rspacefs_op_in_flight{mount=\"/mnt/test\",op=\"lookup\"} 0"));
     }
 }

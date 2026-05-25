@@ -293,7 +293,11 @@ mod linux_main {
             Ok(Err(e)) => Err(e),
             Err(panic_payload) => {
                 let msg = panic_msg(panic_payload);
-                crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
+                crate::fault(
+                    crate::kmsg::Prio::Err,
+                    "panic",
+                    &format!("FUSE session panicked; mount cleaned up: {msg}"),
+                );
                 bail!("FUSE session panicked: {msg}");
             }
         }
@@ -804,7 +808,11 @@ mod linux_main {
                     }
                     Err(p) => {
                         let msg = panic_msg(p);
-                        crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
+                        crate::fault(
+                            crate::kmsg::Prio::Err,
+                            "panic",
+                            &format!("FUSE session panicked; mount cleaned up: {msg}"),
+                        );
                         anyhow::bail!("FUSE session panicked: {msg}");
                     }
                 }
@@ -820,7 +828,11 @@ mod linux_main {
                     Ok(r) => r?,
                     Err(p) => {
                         let msg = panic_msg(p);
-                        crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
+                        crate::fault(
+                            crate::kmsg::Prio::Err,
+                            "panic",
+                            &format!("FUSE session panicked; mount cleaned up: {msg}"),
+                        );
                         anyhow::bail!("FUSE session panicked: {msg}");
                     }
                 }
@@ -842,9 +854,9 @@ mod linux_main {
         };
 
         let want_journald = match format {
-            "journald" => Some(true),  // hard-required
-            "auto" => None,             // try, fall through
-            _ => Some(false),            // text / json — stderr
+            "journald" => Some(true), // hard-required
+            "auto" => None,           // try, fall through
+            _ => Some(false),         // text / json — stderr
         };
 
         if want_journald != Some(false) {
@@ -876,10 +888,7 @@ mod linux_main {
                 .with_target(false)
                 .try_init();
         } else {
-            let _ = fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .try_init();
+            let _ = fmt().with_env_filter(filter).with_target(false).try_init();
         }
     }
 }

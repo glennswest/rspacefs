@@ -32,7 +32,12 @@ pub enum Prio {
 /// "shout into the void if you can" channel, never a hard dependency.
 pub fn write(prio: Prio, msg: &str) {
     let mut line = String::with_capacity(msg.len() + 32);
-    let _ = write!(line, "<{}>rspacefs-mount[{}]: ", prio as u8, std::process::id());
+    let _ = write!(
+        line,
+        "<{}>rspacefs-mount[{}]: ",
+        prio as u8,
+        std::process::id()
+    );
     // Strip newlines — one record per write; embedded newlines split the
     // record at the kernel side and confuse downstream parsers.
     for ch in msg.chars().take(900) {
