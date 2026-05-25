@@ -725,19 +725,110 @@ impl Filesystem for RspacefsFuse {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let _scope = self.stats.scope(Op::Open);
-        self.stats.record(Op::Open, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
+        crate::protect!(self, "open", {
+            self.stats.record(Op::Open, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
 
-        let accmode = flags & libc::O_ACCMODE;
-        let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
-        let fh = self.alloc_fh();
+            let accmode = flags & libc::O_ACCMODE;
+            let writable = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
+            let fh = self.alloc_fh();
 
-        if writable {
-            // Writable: buffer-then-flush. Open via the vfs root so write-
-            // back goes through LayerFS (which does its own copy-up).
+            if writable {
+                // Writable: buffer-then-flush. Open via the vfs root so write-
+                // back goes through LayerFS (which does its own copy-up).
+                let p = match self.root.join(&path) {
+                    Ok(v) => v,
+                    Err(_) => return reply.error(EIO),
+                };
+                if !p.exists().unwrap_or(false) {
+                    return reply.error(ENOENT);
+                }
+                let mut data = Vec::new();
+                if (flags & libc::O_TRUNC) == 0 {
+                    if let Ok(mut f) = p.open_file() {
+                        if f.read_to_end(&mut data).is_err() {
+                            return reply.error(EIO);
+                        }
+                    }
+                }
+                self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
+                self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
+                self.open_files.insert(
+                    fh,
+                    OpenFile::Buffered {
+                        path,
+                        data,
+                        dirty: false,
+                        writable: true,
+                    },
+                );
+                return reply.opened(fh, 0);
+            }
+
+            // Read-only: try passthrough first. Passthrough hands the kernel a
+            // direct fd to the backing file so subsequent reads NEVER hit our
+            // daemon. Only valid when the resolved physical file lives in a
+            // non-verified layer; verity-protected layers must stay on the
+            // daemon path so block hashes are checked.
+            if let Some((phys, layer_idx)) = self.physical_for_with_layer(&path) {
+                let verified = *self.verified_layers.get(layer_idx).unwrap_or(&false);
+                if !verified {
+                    // BackingId cache: if this inode already has a live
+                    // BackingId (because another open hasn't released yet),
+                    // reuse it. One BACKING_OPEN ioctl per file, regardless
+                    // of how many concurrent opens exist.
+                    let mut cache = match self.backing_cache.lock() {
+                        Ok(c) => c,
+                        Err(_) => return reply.error(EIO),
+                    };
+                    let existing = cache.get(&ino).and_then(|w| w.upgrade());
+                    if let Some(backing) = existing {
+                        drop(cache);
+                        self.stats
+                            .backing_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
+                        self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
+                        reply.opened_passthrough(fh, 0, &backing);
+                        self.open_files
+                            .insert(fh, OpenFile::Passthrough { _backing: backing });
+                        return;
+                    }
+                    // Cache miss — try to open + register a fresh backing.
+                    self.stats
+                        .backing_cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Ok(backing_file) = std::fs::File::open(&phys) {
+                        match reply.open_backing(&backing_file) {
+                            Ok(backing) => {
+                                let backing = Arc::new(backing);
+                                cache.insert(ino, Arc::downgrade(&backing));
+                                drop(cache);
+                                self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
+                                self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
+                                reply.opened_passthrough(fh, 0, &backing);
+                                self.open_files
+                                    .insert(fh, OpenFile::Passthrough { _backing: backing });
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "passthrough open failed for {} ({}); falling back to daemon read",
+                                    path,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    drop(cache);
+                }
+            }
+
+            // Fallback / verity path: stream from a SeekAndRead via the overlay
+            // (VerifiedFS hashes each block when applicable).
             let p = match self.root.join(&path) {
                 Ok(v) => v,
                 Err(_) => return reply.error(EIO),
@@ -745,105 +836,16 @@ impl Filesystem for RspacefsFuse {
             if !p.exists().unwrap_or(false) {
                 return reply.error(ENOENT);
             }
-            let mut data = Vec::new();
-            if (flags & libc::O_TRUNC) == 0 {
-                if let Ok(mut f) = p.open_file() {
-                    if f.read_to_end(&mut data).is_err() {
-                        return reply.error(EIO);
-                    }
-                }
-            }
-            self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
-            self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-            self.open_files.insert(
-                fh,
-                OpenFile::Buffered {
-                    path,
-                    data,
-                    dirty: false,
-                    writable: true,
-                },
-            );
-            return reply.opened(fh, 0);
-        }
-
-        // Read-only: try passthrough first. Passthrough hands the kernel a
-        // direct fd to the backing file so subsequent reads NEVER hit our
-        // daemon. Only valid when the resolved physical file lives in a
-        // non-verified layer; verity-protected layers must stay on the
-        // daemon path so block hashes are checked.
-        if let Some((phys, layer_idx)) = self.physical_for_with_layer(&path) {
-            let verified = *self.verified_layers.get(layer_idx).unwrap_or(&false);
-            if !verified {
-                // BackingId cache: if this inode already has a live
-                // BackingId (because another open hasn't released yet),
-                // reuse it. One BACKING_OPEN ioctl per file, regardless
-                // of how many concurrent opens exist.
-                let mut cache = match self.backing_cache.lock() {
-                    Ok(c) => c,
-                    Err(_) => return reply.error(EIO),
-                };
-                let existing = cache.get(&ino).and_then(|w| w.upgrade());
-                if let Some(backing) = existing {
-                    drop(cache);
-                    self.stats
-                        .backing_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
+            match p.open_file() {
+                Ok(reader) => {
+                    self.stats.streaming_opens.fetch_add(1, Ordering::Relaxed);
                     self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-                    reply.opened_passthrough(fh, 0, &backing);
-                    self.open_files
-                        .insert(fh, OpenFile::Passthrough { _backing: backing });
-                    return;
+                    self.open_files.insert(fh, OpenFile::Streaming { reader });
+                    reply.opened(fh, 0);
                 }
-                // Cache miss — try to open + register a fresh backing.
-                self.stats
-                    .backing_cache_misses
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Ok(backing_file) = std::fs::File::open(&phys) {
-                    match reply.open_backing(&backing_file) {
-                        Ok(backing) => {
-                            let backing = Arc::new(backing);
-                            cache.insert(ino, Arc::downgrade(&backing));
-                            drop(cache);
-                            self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
-                            self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-                            reply.opened_passthrough(fh, 0, &backing);
-                            self.open_files
-                                .insert(fh, OpenFile::Passthrough { _backing: backing });
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "passthrough open failed for {} ({}); falling back to daemon read",
-                                path,
-                                e
-                            );
-                        }
-                    }
-                }
-                drop(cache);
+                Err(_) => reply.error(EIO),
             }
-        }
-
-        // Fallback / verity path: stream from a SeekAndRead via the overlay
-        // (VerifiedFS hashes each block when applicable).
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        if !p.exists().unwrap_or(false) {
-            return reply.error(ENOENT);
-        }
-        match p.open_file() {
-            Ok(reader) => {
-                self.stats.streaming_opens.fetch_add(1, Ordering::Relaxed);
-                self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-                self.open_files.insert(fh, OpenFile::Streaming { reader });
-                reply.opened(fh, 0);
-            }
-            Err(_) => reply.error(EIO),
-        }
+        });
     }
 
     fn read(
@@ -858,47 +860,48 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyData,
     ) {
         let _scope = self.stats.scope(Op::Read);
-        let Some(file) = self.open_files.get_mut(&fh) else {
-            self.stats.record(Op::Read, ino, 0, EBADF);
-            return reply.error(EBADF);
-        };
-        match file {
-            // Kernel should be serving these directly via passthrough; if we
-            // see a read on a passthrough handle something has slipped.
-            OpenFile::Passthrough { .. } => {
-                self.stats.record(Op::Read, ino, 0, EIO);
-                reply.error(EIO)
-            }
-            OpenFile::Streaming { reader } => {
-                if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
+        crate::protect!(self, "read", {
+            let Some(file) = self.open_files.get_mut(&fh) else {
+                self.stats.record(Op::Read, ino, 0, EBADF);
+                return reply.error(EBADF);
+            };
+            match file {
+                // Kernel should be serving these directly via passthrough; if we
+                // see a read on a passthrough handle something has slipped.
+                OpenFile::Passthrough { .. } => {
                     self.stats.record(Op::Read, ino, 0, EIO);
-                    return reply.error(EIO);
+                    reply.error(EIO)
                 }
-                let mut buf = vec![0u8; size as usize];
-                match reader.read(&mut buf) {
-                    Ok(n) => {
-                        buf.truncate(n);
-                        self.stats.record(Op::Read, ino, n as u64, 0);
-                        reply.data(&buf);
-                    }
-                    Err(_) => {
+                OpenFile::Streaming { reader } => {
+                    if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
                         self.stats.record(Op::Read, ino, 0, EIO);
-                        reply.error(EIO)
+                        return reply.error(EIO);
+                    }
+                    let mut buf = vec![0u8; size as usize];
+                    match reader.read(&mut buf) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            self.stats.record(Op::Read, ino, n as u64, 0);
+                            reply.data(&buf);
+                        }
+                        Err(_) => {
+                            self.stats.record(Op::Read, ino, 0, EIO);
+                            reply.error(EIO)
+                        }
                     }
                 }
-            }
-            OpenFile::Buffered { data, .. } => {
-                let start = offset as usize;
-                if start >= data.len() {
-                    let _scope = self.stats.scope(Op::Read);
-                    self.stats.record(Op::Read, ino, 0, 0);
-                    return reply.data(&[]);
+                OpenFile::Buffered { data, .. } => {
+                    let start = offset as usize;
+                    if start >= data.len() {
+                        self.stats.record(Op::Read, ino, 0, 0);
+                        return reply.data(&[]);
+                    }
+                    let end = (start + size as usize).min(data.len());
+                    self.stats.record(Op::Read, ino, (end - start) as u64, 0);
+                    reply.data(&data[start..end]);
                 }
-                let end = (start + size as usize).min(data.len());
-                self.stats.record(Op::Read, ino, (end - start) as u64, 0);
-                reply.data(&data[start..end]);
             }
-        }
+        });
     }
 
     fn write(
@@ -913,36 +916,39 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let Some(file) = self.open_files.get_mut(&fh) else {
-            self.stats.record(Op::Write, ino, 0, EBADF);
-            return reply.error(EBADF);
-        };
-        match file {
-            OpenFile::Passthrough { .. } | OpenFile::Streaming { .. } => {
-                self.stats.record(Op::Write, ino, 0, libc::EACCES);
-                reply.error(libc::EACCES)
-            }
-            OpenFile::Buffered {
-                data: buf,
-                dirty,
-                writable,
-                ..
-            } => {
-                if !*writable {
+        let _scope = self.stats.scope(Op::Write);
+        crate::protect!(self, "write", {
+            let Some(file) = self.open_files.get_mut(&fh) else {
+                self.stats.record(Op::Write, ino, 0, EBADF);
+                return reply.error(EBADF);
+            };
+            match file {
+                OpenFile::Passthrough { .. } | OpenFile::Streaming { .. } => {
                     self.stats.record(Op::Write, ino, 0, libc::EACCES);
-                    return reply.error(libc::EACCES);
+                    reply.error(libc::EACCES)
                 }
-                let off = offset as usize;
-                let end = off + data.len();
-                if end > buf.len() {
-                    buf.resize(end, 0);
+                OpenFile::Buffered {
+                    data: buf,
+                    dirty,
+                    writable,
+                    ..
+                } => {
+                    if !*writable {
+                        self.stats.record(Op::Write, ino, 0, libc::EACCES);
+                        return reply.error(libc::EACCES);
+                    }
+                    let off = offset as usize;
+                    let end = off + data.len();
+                    if end > buf.len() {
+                        buf.resize(end, 0);
+                    }
+                    buf[off..end].copy_from_slice(data);
+                    *dirty = true;
+                    self.stats.record(Op::Write, ino, data.len() as u64, 0);
+                    reply.written(data.len() as u32);
                 }
-                buf[off..end].copy_from_slice(data);
-                *dirty = true;
-                self.stats.record(Op::Write, ino, data.len() as u64, 0);
-                reply.written(data.len() as u32);
             }
-        }
+        });
     }
 
     fn release(
@@ -956,34 +962,36 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEmpty,
     ) {
         let _scope = self.stats.scope(Op::Release);
-        self.stats.record(Op::Release, ino, 0, 0);
-        self.stats.open_handles.fetch_sub(1, Ordering::Relaxed);
-        let Some(file) = self.open_files.remove(&fh) else {
-            return reply.error(EBADF);
-        };
-        match file {
-            // Drop on BackingId fires BACKING_CLOSE in the kernel.
-            OpenFile::Passthrough { .. } => reply.ok(),
-            OpenFile::Streaming { .. } => reply.ok(),
-            OpenFile::Buffered {
-                path, data, dirty, ..
-            } => {
-                if dirty {
-                    let p = match self.root.join(&path) {
-                        Ok(v) => v,
-                        Err(_) => return reply.error(EIO),
-                    };
-                    let mut w = match p.create_file() {
-                        Ok(w) => w,
-                        Err(_) => return reply.error(EIO),
-                    };
-                    if w.write_all(&data).is_err() || w.flush().is_err() {
-                        return reply.error(EIO);
+        crate::protect!(self, "release", {
+            self.stats.record(Op::Release, ino, 0, 0);
+            self.stats.open_handles.fetch_sub(1, Ordering::Relaxed);
+            let Some(file) = self.open_files.remove(&fh) else {
+                return reply.error(EBADF);
+            };
+            match file {
+                // Drop on BackingId fires BACKING_CLOSE in the kernel.
+                OpenFile::Passthrough { .. } => reply.ok(),
+                OpenFile::Streaming { .. } => reply.ok(),
+                OpenFile::Buffered {
+                    path, data, dirty, ..
+                } => {
+                    if dirty {
+                        let p = match self.root.join(&path) {
+                            Ok(v) => v,
+                            Err(_) => return reply.error(EIO),
+                        };
+                        let mut w = match p.create_file() {
+                            Ok(w) => w,
+                            Err(_) => return reply.error(EIO),
+                        };
+                        if w.write_all(&data).is_err() || w.flush().is_err() {
+                            return reply.error(EIO);
+                        }
                     }
+                    reply.ok();
                 }
-                reply.ok();
             }
-        }
+        });
     }
 
     fn create(
@@ -997,76 +1005,80 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyCreate,
     ) {
         let _scope = self.stats.scope(Op::Create);
-        self.stats.record(Op::Create, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        // Open-or-create semantics: if file exists and O_EXCL not set, treat as
-        // open. If O_EXCL is set, fail with EEXIST when the entry already exists.
-        let exists = p.exists().unwrap_or(false);
-        if exists && (flags & libc::O_EXCL) != 0 {
-            return reply.error(EEXIST);
-        }
-        if !exists {
-            if p.create_file().is_err() {
-                return reply.error(EIO);
+        crate::protect!(self, "create", {
+            self.stats.record(Op::Create, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
+            let p = match self.root.join(&path) {
+                Ok(v) => v,
+                Err(_) => return reply.error(EIO),
+            };
+            // Open-or-create semantics: if file exists and O_EXCL not set, treat as
+            // open. If O_EXCL is set, fail with EEXIST when the entry already exists.
+            let exists = p.exists().unwrap_or(false);
+            if exists && (flags & libc::O_EXCL) != 0 {
+                return reply.error(EEXIST);
             }
-        } else if (flags & libc::O_TRUNC) != 0 {
-            // O_TRUNC on existing file — clobber.
-            if p.create_file().is_err() {
-                return reply.error(EIO);
+            if !exists {
+                if p.create_file().is_err() {
+                    return reply.error(EIO);
+                }
+            } else if (flags & libc::O_TRUNC) != 0 {
+                // O_TRUNC on existing file — clobber.
+                if p.create_file().is_err() {
+                    return reply.error(EIO);
+                }
             }
-        }
 
-        let ino = self.intern_path(path.clone());
-        let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
-        let fh = self.alloc_fh();
-        self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
-        self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-        self.open_files.insert(
-            fh,
-            OpenFile::Buffered {
-                path,
-                data: Vec::new(),
-                dirty: false,
-                writable: true,
-            },
-        );
-        reply.created(&TTL, &attr, 0, fh, 0);
+            let ino = self.intern_path(path.clone());
+            let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
+            let fh = self.alloc_fh();
+            self.stats.buffered_opens.fetch_add(1, Ordering::Relaxed);
+            self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
+            self.open_files.insert(
+                fh,
+                OpenFile::Buffered {
+                    path,
+                    data: Vec::new(),
+                    dirty: false,
+                    writable: true,
+                },
+            );
+            reply.created(&TTL, &attr, 0, fh, 0);
+        });
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let _scope = self.stats.scope(Op::Unlink);
-        self.stats.record(Op::Unlink, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
-        let p = match self.root.join(&path) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        if !p.exists().unwrap_or(false) {
-            return reply.error(ENOENT);
-        }
-        if p.remove_file().is_err() {
-            return reply.error(EIO);
-        }
-        if let Some(ino) = self.paths.remove(&path) {
-            self.inodes.remove(&ino);
-        }
-        reply.ok();
+        crate::protect!(self, "unlink", {
+            self.stats.record(Op::Unlink, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
+            let p = match self.root.join(&path) {
+                Ok(v) => v,
+                Err(_) => return reply.error(EIO),
+            };
+            if !p.exists().unwrap_or(false) {
+                return reply.error(ENOENT);
+            }
+            if p.remove_file().is_err() {
+                return reply.error(EIO);
+            }
+            if let Some(ino) = self.paths.remove(&path) {
+                self.inodes.remove(&ino);
+            }
+            reply.ok();
+        });
     }
 
     fn rename(
@@ -1080,73 +1092,77 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEmpty,
     ) {
         let _scope = self.stats.scope(Op::Rename);
-        self.stats.record(Op::Rename, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let new_parent_path = match self.path_of(newparent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(src) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
-        let Some(dst) = Self::join(&new_parent_path, newname) else {
-            return reply.error(EINVAL);
-        };
+        crate::protect!(self, "rename", {
+            self.stats.record(Op::Rename, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let new_parent_path = match self.path_of(newparent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(src) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
+            let Some(dst) = Self::join(&new_parent_path, newname) else {
+                return reply.error(EINVAL);
+            };
 
-        let src_p = match self.root.join(&src) {
-            Ok(v) => v,
-            Err(_) => return reply.error(EIO),
-        };
-        let is_dir = matches!(
-            src_p.metadata().map(|m| m.file_type),
-            Ok(VfsFileType::Directory)
-        );
-
-        let res = if is_dir {
-            src_p.move_dir(&match self.root.join(&dst) {
+            let src_p = match self.root.join(&src) {
                 Ok(v) => v,
                 Err(_) => return reply.error(EIO),
-            })
-        } else {
-            src_p.move_file(&match self.root.join(&dst) {
-                Ok(v) => v,
-                Err(_) => return reply.error(EIO),
-            })
-        };
+            };
+            let is_dir = matches!(
+                src_p.metadata().map(|m| m.file_type),
+                Ok(VfsFileType::Directory)
+            );
 
-        match res {
-            Ok(_) => {
-                // Update inode bindings.
-                if let Some(ino) = self.paths.remove(&src) {
-                    self.inodes.insert(ino, dst.clone());
-                    self.paths.insert(dst, ino);
+            let res = if is_dir {
+                src_p.move_dir(&match self.root.join(&dst) {
+                    Ok(v) => v,
+                    Err(_) => return reply.error(EIO),
+                })
+            } else {
+                src_p.move_file(&match self.root.join(&dst) {
+                    Ok(v) => v,
+                    Err(_) => return reply.error(EIO),
+                })
+            };
+
+            match res {
+                Ok(_) => {
+                    // Update inode bindings.
+                    if let Some(ino) = self.paths.remove(&src) {
+                        self.inodes.insert(ino, dst.clone());
+                        self.paths.insert(dst, ino);
+                    }
+                    reply.ok();
                 }
-                reply.ok();
+                Err(_) => reply.error(EIO),
             }
-            Err(_) => reply.error(EIO),
-        }
+        });
     }
 
     // ── Symlinks ────────────────────────────────────────────────────────────
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         let _scope = self.stats.scope(Op::Readlink);
-        self.stats.record(Op::Readlink, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let phys = match self.physical_for(&path) {
-            Some(p) => p,
-            None => return reply.error(ENOENT),
-        };
-        match std::fs::read_link(&phys) {
-            Ok(target) => reply.data(target.as_os_str().as_bytes()),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+        crate::protect!(self, "readlink", {
+            self.stats.record(Op::Readlink, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let phys = match self.physical_for(&path) {
+                Some(p) => p,
+                None => return reply.error(ENOENT),
+            };
+            match std::fs::read_link(&phys) {
+                Ok(target) => reply.data(target.as_os_str().as_bytes()),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            }
+        });
     }
 
     fn symlink(
@@ -1158,41 +1174,43 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEntry,
     ) {
         let _scope = self.stats.scope(Op::Symlink);
-        self.stats.record(Op::Symlink, parent, 0, 0);
-        let parent_path = match self.path_of(parent) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let Some(path) = Self::join(&parent_path, name) else {
-            return reply.error(EINVAL);
-        };
+        crate::protect!(self, "symlink", {
+            self.stats.record(Op::Symlink, parent, 0, 0);
+            let parent_path = match self.path_of(parent) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let Some(path) = Self::join(&parent_path, name) else {
+                return reply.error(EINVAL);
+            };
 
-        // Symlinks always go into the upper layer (writable, index 0).
-        // First clear any whiteout marker on this path so the new symlink
-        // is visible to the merge view.
-        let mut wh = self.layers[0].clone();
-        if !parent_path.is_empty() {
-            wh.push(&parent_path);
-        }
-        wh.push(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
-        let _ = std::fs::remove_file(&wh);
-
-        // Ensure parent dirs exist in upper.
-        let upper_path = self.layers[0].join(&path);
-        if let Some(parent_dir) = upper_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent_dir) {
-                return reply.error(e.raw_os_error().unwrap_or(EIO));
+            // Symlinks always go into the upper layer (writable, index 0).
+            // First clear any whiteout marker on this path so the new symlink
+            // is visible to the merge view.
+            let mut wh = self.layers[0].clone();
+            if !parent_path.is_empty() {
+                wh.push(&parent_path);
             }
-        }
+            wh.push(format!("{}{}", WHITEOUT_PREFIX, name.to_string_lossy()));
+            let _ = std::fs::remove_file(&wh);
 
-        match std::os::unix::fs::symlink(link, &upper_path) {
-            Ok(_) => {
-                let ino = self.intern_path(path.clone());
-                let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
-                reply.entry(&TTL, &attr, 0);
+            // Ensure parent dirs exist in upper.
+            let upper_path = self.layers[0].join(&path);
+            if let Some(parent_dir) = upper_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent_dir) {
+                    return reply.error(e.raw_os_error().unwrap_or(EIO));
+                }
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+
+            match std::os::unix::fs::symlink(link, &upper_path) {
+                Ok(_) => {
+                    let ino = self.intern_path(path.clone());
+                    let attr = self.make_attr(ino, &path, VfsFileType::File, 0);
+                    reply.entry(&TTL, &attr, 0);
+                }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            }
+        });
     }
 
     // ── Extended attributes ─────────────────────────────────────────────────
@@ -1206,59 +1224,63 @@ impl Filesystem for RspacefsFuse {
         reply: fuser::ReplyXattr,
     ) {
         let _scope = self.stats.scope(Op::Getxattr);
-        self.stats.record(Op::Getxattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let phys = match self.physical_for(&path) {
-            Some(p) => p,
-            None => return reply.error(ENOENT),
-        };
-        match xattr::get(&phys, name) {
-            Ok(Some(val)) => {
-                if size == 0 {
-                    reply.size(val.len() as u32);
-                } else if (size as usize) < val.len() {
-                    reply.error(libc::ERANGE);
-                } else {
-                    reply.data(&val);
+        crate::protect!(self, "getxattr", {
+            self.stats.record(Op::Getxattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let phys = match self.physical_for(&path) {
+                Some(p) => p,
+                None => return reply.error(ENOENT),
+            };
+            match xattr::get(&phys, name) {
+                Ok(Some(val)) => {
+                    if size == 0 {
+                        reply.size(val.len() as u32);
+                    } else if (size as usize) < val.len() {
+                        reply.error(libc::ERANGE);
+                    } else {
+                        reply.data(&val);
+                    }
                 }
+                Ok(None) => reply.error(libc::ENODATA),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
             }
-            Ok(None) => reply.error(libc::ENODATA),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+        });
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
         let _scope = self.stats.scope(Op::Listxattr);
-        self.stats.record(Op::Listxattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let phys = match self.physical_for(&path) {
-            Some(p) => p,
-            None => return reply.error(ENOENT),
-        };
-        match xattr::list(&phys) {
-            Ok(iter) => {
-                // FUSE expects a NUL-separated, NUL-terminated list of names.
-                let mut buf = Vec::new();
-                for name in iter {
-                    buf.extend_from_slice(name.as_bytes());
-                    buf.push(0);
+        crate::protect!(self, "listxattr", {
+            self.stats.record(Op::Listxattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let phys = match self.physical_for(&path) {
+                Some(p) => p,
+                None => return reply.error(ENOENT),
+            };
+            match xattr::list(&phys) {
+                Ok(iter) => {
+                    // FUSE expects a NUL-separated, NUL-terminated list of names.
+                    let mut buf = Vec::new();
+                    for name in iter {
+                        buf.extend_from_slice(name.as_bytes());
+                        buf.push(0);
+                    }
+                    if size == 0 {
+                        reply.size(buf.len() as u32);
+                    } else if (size as usize) < buf.len() {
+                        reply.error(libc::ERANGE);
+                    } else {
+                        reply.data(&buf);
+                    }
                 }
-                if size == 0 {
-                    reply.size(buf.len() as u32);
-                } else if (size as usize) < buf.len() {
-                    reply.error(libc::ERANGE);
-                } else {
-                    reply.data(&buf);
-                }
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
             }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+        });
     }
 
     fn setxattr(
@@ -1272,37 +1294,41 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEmpty,
     ) {
         let _scope = self.stats.scope(Op::Setxattr);
-        self.stats.record(Op::Setxattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        // xattr writes need a writable target; ensure the file is in upper.
-        let upper = match self.ensure_in_upper(&path) {
-            Ok(p) => p,
-            Err(errno) => return reply.error(errno),
-        };
-        match xattr::set(&upper, name, value) {
-            Ok(_) => reply.ok(),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+        crate::protect!(self, "setxattr", {
+            self.stats.record(Op::Setxattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            // xattr writes need a writable target; ensure the file is in upper.
+            let upper = match self.ensure_in_upper(&path) {
+                Ok(p) => p,
+                Err(errno) => return reply.error(errno),
+            };
+            match xattr::set(&upper, name, value) {
+                Ok(_) => reply.ok(),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            }
+        });
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         let _scope = self.stats.scope(Op::Removexattr);
-        self.stats.record(Op::Removexattr, ino, 0, 0);
-        let path = match self.path_of(ino) {
-            Some(p) => p.to_string(),
-            None => return reply.error(ENOENT),
-        };
-        let upper = match self.ensure_in_upper(&path) {
-            Ok(p) => p,
-            Err(errno) => return reply.error(errno),
-        };
-        match xattr::remove(&upper, name) {
-            Ok(_) => reply.ok(),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
-        }
+        crate::protect!(self, "removexattr", {
+            self.stats.record(Op::Removexattr, ino, 0, 0);
+            let path = match self.path_of(ino) {
+                Some(p) => p.to_string(),
+                None => return reply.error(ENOENT),
+            };
+            let upper = match self.ensure_in_upper(&path) {
+                Ok(p) => p,
+                Err(errno) => return reply.error(errno),
+            };
+            match xattr::remove(&upper, name) {
+                Ok(_) => reply.ok(),
+                Err(e) => reply.error(e.raw_os_error().unwrap_or(EIO)),
+            }
+        });
     }
 
     // ── poll(2) ─────────────────────────────────────────────────────────────
@@ -1318,54 +1344,58 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyPoll,
     ) {
         let _scope = self.stats.scope(Op::Poll);
-        self.stats.record(Op::Poll, ino, 0, 0);
-        // Regular files and directories on a plain filesystem are *always*
-        // poll-ready in the POSIX sense — read() / write() don't block on
-        // them like they do on sockets / pipes / FIFOs. Echo back exactly
-        // the events the caller asked about so select(2) / poll(2) /
-        // epoll(2) all see "ready" and move on.
-        //
-        // This matches what tmpfs / ext4 / overlay would return for the
-        // same fds; container runtimes (notably crun / runc when probing
-        // /proc fds in the merged tree) expect this behaviour.
-        reply.poll(events);
+        crate::protect!(self, "poll", {
+            self.stats.record(Op::Poll, ino, 0, 0);
+            // Regular files and directories on a plain filesystem are *always*
+            // poll-ready in the POSIX sense — read() / write() don't block on
+            // them like they do on sockets / pipes / FIFOs. Echo back exactly
+            // the events the caller asked about so select(2) / poll(2) /
+            // epoll(2) all see "ready" and move on.
+            //
+            // This matches what tmpfs / ext4 / overlay would return for the
+            // same fds; container runtimes (notably crun / runc when probing
+            // /proc fds in the merged tree) expect this behaviour.
+            reply.poll(events);
+        });
     }
 
     // ── Durable writes ──────────────────────────────────────────────────────
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let _scope = self.stats.scope(Op::Fsync);
-        self.stats.record(Op::Fsync, ino, 0, 0);
-        // For Buffered (writable) handles: flush in-memory dirty data to
-        // the upper file now. Streaming (read-only) handles have nothing
-        // to sync — return OK.
-        let Some(file) = self.open_files.get_mut(&fh) else {
-            return reply.error(EBADF);
-        };
-        match file {
-            OpenFile::Passthrough { .. } => reply.ok(),
-            OpenFile::Streaming { .. } => reply.ok(),
-            OpenFile::Buffered {
-                path, data, dirty, ..
-            } => {
-                if !*dirty {
-                    return reply.ok();
+        crate::protect!(self, "fsync", {
+            self.stats.record(Op::Fsync, ino, 0, 0);
+            // For Buffered (writable) handles: flush in-memory dirty data to
+            // the upper file now. Streaming (read-only) handles have nothing
+            // to sync — return OK.
+            let Some(file) = self.open_files.get_mut(&fh) else {
+                return reply.error(EBADF);
+            };
+            match file {
+                OpenFile::Passthrough { .. } => reply.ok(),
+                OpenFile::Streaming { .. } => reply.ok(),
+                OpenFile::Buffered {
+                    path, data, dirty, ..
+                } => {
+                    if !*dirty {
+                        return reply.ok();
+                    }
+                    let p = match self.root.join(path) {
+                        Ok(v) => v,
+                        Err(_) => return reply.error(EIO),
+                    };
+                    let mut w = match p.create_file() {
+                        Ok(w) => w,
+                        Err(_) => return reply.error(EIO),
+                    };
+                    if w.write_all(data).is_err() || w.flush().is_err() {
+                        return reply.error(EIO);
+                    }
+                    *dirty = false;
+                    reply.ok();
                 }
-                let p = match self.root.join(path) {
-                    Ok(v) => v,
-                    Err(_) => return reply.error(EIO),
-                };
-                let mut w = match p.create_file() {
-                    Ok(w) => w,
-                    Err(_) => return reply.error(EIO),
-                };
-                if w.write_all(data).is_err() || w.flush().is_err() {
-                    return reply.error(EIO);
-                }
-                *dirty = false;
-                reply.ok();
             }
-        }
+        });
     }
 
     fn flush(
@@ -1377,32 +1407,36 @@ impl Filesystem for RspacefsFuse {
         reply: ReplyEmpty,
     ) {
         let _scope = self.stats.scope(Op::Flush);
-        self.stats.record(Op::Flush, ino, 0, 0);
-        // Per POSIX: close() may flush; the kernel calls flush per close.
-        // We do the actual write-back in release() to coalesce, so flush
-        // is a no-op for our buffered model. Returning OK lets close()
-        // complete without spurious EIO.
-        reply.ok();
+        crate::protect!(self, "flush", {
+            self.stats.record(Op::Flush, ino, 0, 0);
+            // Per POSIX: close() may flush; the kernel calls flush per close.
+            // We do the actual write-back in release() to coalesce, so flush
+            // is a no-op for our buffered model. Returning OK lets close()
+            // complete without spurious EIO.
+            reply.ok();
+        });
     }
 
     // ── Statfs ──────────────────────────────────────────────────────────────
 
     fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
         let _scope = self.stats.scope(Op::Statfs);
-        self.stats.record(Op::Statfs, ino, 0, 0);
-        // Synthesised — we don't know the underlying disk's real numbers
-        // without poking the upper layer's backing filesystem. Report large
-        // dummy values so callers don't think they're out of space.
-        reply.statfs(
-            1 << 30, // total blocks
-            1 << 30, // free blocks
-            1 << 30, // avail blocks
-            1 << 20, // total files
-            1 << 20, // free files
-            BLOCK_SIZE,
-            255, // max name length
-            BLOCK_SIZE,
-        );
+        crate::protect!(self, "statfs", {
+            self.stats.record(Op::Statfs, ino, 0, 0);
+            // Synthesised — we don't know the underlying disk's real numbers
+            // without poking the upper layer's backing filesystem. Report large
+            // dummy values so callers don't think they're out of space.
+            reply.statfs(
+                1 << 30, // total blocks
+                1 << 30, // free blocks
+                1 << 30, // avail blocks
+                1 << 20, // total files
+                1 << 20, // free files
+                BLOCK_SIZE,
+                255, // max name length
+                BLOCK_SIZE,
+            );
+        });
     }
 }
 
