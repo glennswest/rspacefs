@@ -29,3 +29,4 @@ serde_json = { workspace = true }
 fuser = { workspace = true }
 libc = { workspace = true }
 xattr = { workspace = true }
+tracing-journald = "0.3"

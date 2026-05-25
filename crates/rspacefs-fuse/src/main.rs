@@ -16,9 +16,38 @@ mod control;
 #[cfg(target_os = "linux")]
 mod fs;
 #[cfg(target_os = "linux")]
+mod kmsg;
+#[cfg(target_os = "linux")]
 mod metrics;
 #[cfg(target_os = "linux")]
 mod stats;
+
+#[cfg(target_os = "linux")]
+mod kmsg_faults_enabled {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(true);
+    pub fn set(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+    pub fn get() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+}
+
+/// Emit one record to `/dev/kmsg` AND a structured tracing event. Used at
+/// fault sites so the same payload shows up in both journald (rich fields)
+/// and `dmesg` (kernel ring buffer, survives userspace journal outages).
+#[cfg(target_os = "linux")]
+fn fault(prio: kmsg::Prio, kind: &str, msg: &str) {
+    match prio {
+        kmsg::Prio::Err => tracing::error!(fault = kind, "{msg}"),
+        kmsg::Prio::Warn => tracing::warn!(fault = kind, "{msg}"),
+        kmsg::Prio::Info => tracing::info!(fault = kind, "{msg}"),
+    }
+    if kmsg_faults_enabled::get() {
+        kmsg::write(prio, &format!("[{kind}] {msg}"));
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux_main {
@@ -100,7 +129,9 @@ mod linux_main {
     /// lower listed here gets verity-pinned mode; lowers not listed are
     /// plain (passthrough-eligible).
     pub fn run_mount_program(argv: &[std::ffi::OsString]) -> Result<()> {
-        init_tracing(false);
+        // mount_program is invoked under containers-storage / CRI-O — that
+        // always runs under systemd, so default to journald.
+        init_tracing(false, "auto");
 
         let mut iter = argv.iter().peekable();
         let _ = iter.next(); // skip program name
@@ -262,7 +293,7 @@ mod linux_main {
             Ok(Err(e)) => Err(e),
             Err(panic_payload) => {
                 let msg = panic_msg(panic_payload);
-                tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
                 bail!("FUSE session panicked: {msg}");
             }
         }
@@ -538,6 +569,23 @@ mod linux_main {
         #[arg(long)]
         debug: bool,
 
+        /// Log output format / destination. `auto` (default) writes to
+        /// journald when stderr is connected to it (the systemd / containerd
+        /// case), otherwise falls back to text-on-stderr. `text` forces
+        /// human-readable stderr. `json` forces newline-delimited JSON on
+        /// stderr (good for `journalctl` ingestion of older systemd or for
+        /// stdout-based log shippers). `journald` forces journald and errors
+        /// if it can't connect.
+        #[arg(long, value_name = "FMT", default_value = "auto")]
+        log_format: String,
+
+        /// Also write fault-class events (panics, EIO, lock poisoning,
+        /// kernel-mount cleanup) to `/dev/kmsg` so they appear in `dmesg`
+        /// even if journald is unreachable. Best-effort; no-op when the
+        /// process lacks `CAP_SYSLOG`.
+        #[arg(long, default_value_t = true)]
+        kmsg_faults: bool,
+
         /// Path for an optional Unix-socket control surface. When set,
         /// rspacefs-mount listens on this socket for newline-delimited JSON
         /// commands (`status`, `invalidate`, `ping`, ...). Use `rspacefs ctl
@@ -578,7 +626,9 @@ mod linux_main {
 
     pub fn run() -> Result<()> {
         let cli = Cli::parse();
-        init_tracing(cli.debug);
+        init_tracing(cli.debug, &cli.log_format);
+        // Stash kmsg_faults so panic handlers / setattr error paths can read it.
+        crate::kmsg_faults_enabled::set(cli.kmsg_faults);
 
         if !cli.upper.is_dir() {
             bail!("upper layer is not a directory: {}", cli.upper.display());
@@ -754,7 +804,7 @@ mod linux_main {
                     }
                     Err(p) => {
                         let msg = panic_msg(p);
-                        tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                        crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
                         anyhow::bail!("FUSE session panicked: {msg}");
                     }
                 }
@@ -770,7 +820,7 @@ mod linux_main {
                     Ok(r) => r?,
                     Err(p) => {
                         let msg = panic_msg(p);
-                        tracing::error!(panic = %msg, "FUSE session panicked; mount cleaned up");
+                        crate::fault(crate::kmsg::Prio::Err, "panic", &format!("FUSE session panicked; mount cleaned up: {msg}"));
                         anyhow::bail!("FUSE session panicked: {msg}");
                     }
                 }
@@ -780,17 +830,57 @@ mod linux_main {
         Ok(())
     }
 
-    fn init_tracing(debug: bool) {
+    fn init_tracing(debug: bool, format: &str) {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::{fmt, EnvFilter, Registry};
+
         let filter = if debug {
-            tracing_subscriber::EnvFilter::new("rspacefs_fuse=debug,info")
+            EnvFilter::new("rspacefs_fuse=debug,info")
         } else {
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
         };
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .try_init();
+
+        let want_journald = match format {
+            "journald" => Some(true),  // hard-required
+            "auto" => None,             // try, fall through
+            _ => Some(false),            // text / json — stderr
+        };
+
+        if want_journald != Some(false) {
+            match tracing_journald::layer() {
+                Ok(layer) => {
+                    let _ = Registry::default().with(filter).with(layer).try_init();
+                    return;
+                }
+                Err(e) => {
+                    if want_journald == Some(true) {
+                        eprintln!("--log-format=journald requested but unavailable: {e}");
+                        std::process::exit(2);
+                    }
+                    // auto: silently fall through to stderr.
+                }
+            }
+        }
+
+        // stderr — text or JSON.
+        let filter = if debug {
+            EnvFilter::new("rspacefs_fuse=debug,info")
+        } else {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        };
+        if format == "json" {
+            let _ = fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+        } else {
+            let _ = fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+        }
     }
 }
 
