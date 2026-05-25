@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 2026-05-25
+- **chore (fuse):** `cargo fmt` pass on `fs.rs`, left uncommitted after the #24 protect! wrapping. No behavior change — line-wrapping and struct-literal expansion only. Workspace now passes `cargo fmt --all -- --check`.
+
 ### 2026-05-24
 - **feat (fuse):** Daemon hardening — `protect!` macro wraps every FUSE op handler in `std::panic::catch_unwind` with `AssertUnwindSafe`. On panic: bumps `faults_panic`, emits a structured fault event (journald + dmesg), and lets the dropped `reply` fall through to fuser's default ENOSYS reply so the kernel sees a complete (degraded) response instead of waiting. The session loop, the kernel mount, and every other container using the mount stay alive — one buggy op stays contained to that one op. All 23 FUSE methods wrapped (lookup, getattr, setattr, readdir, mkdir, rmdir, open, read, write, release, create, unlink, rename, readlink, symlink, getxattr, listxattr, setxattr, removexattr, poll, fsync, flush, statfs). `panic_msg` lifted to `crate::fs` as a pub helper so the macro and the session-level fallback share one extractor. Closes [#24](https://github.com/glennswest/rspacefs/issues/24). Stale `let _scope` line inside `read::OpenFile::Buffered` arm from the #26 sed cleaned up.
 - **docs:** `docs/faults.md` — enumerates every fault class (`op_panic`, `session_retry`, `lock_poisoned`, `unexpected_errno`) with symptom / recovery / caller surface / steady-state expectation. Documents the journald + dmesg + counter triad. Includes a "what to do when you see this" line per fault so operator triage doesn't depend on tribal knowledge. Acceptance for the 1000-op fault-injection harness is noted as a deferred follow-up.
