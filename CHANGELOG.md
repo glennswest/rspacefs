@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### 2026-05-25
+- **docs:** `docs/concurrency.md` — design for #23 concurrent FUSE ops. Documents why `fuser::Session::run()` is single-threaded by design, the `Send` `Reply*` offload mechanism fuser sanctions, the per-handle `Arc<Mutex<OpenFile>>` model (cross-handle parallel, per-handle serial), what's shared vs. lock-free, which ops offload (`read`/`write`) vs. stay inline (`open`/`release`/`fsync`, deferred), and panic/poison containment in workers. Work plan updated with the in-progress #23 entry.
 - **chore (fuse):** `cargo fmt` pass on `fs.rs`, left uncommitted after the #24 protect! wrapping. No behavior change — line-wrapping and struct-literal expansion only. Workspace now passes `cargo fmt --all -- --check`.
 
 ### 2026-05-24

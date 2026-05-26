@@ -176,6 +176,21 @@ runtime `pivot_root`s the container into it.
 
 ### In Progress
 
+- [ ] (started 2026-05-25) **#23 concurrent FUSE ops.** `fuser::Session::run()`
+  is a single-threaded read-dispatch loop by design (one reused buffer);
+  the documented way to get concurrency is for an op handler to hand its
+  `Reply*` (which is `Send`) to a worker thread and return, freeing the
+  dispatch loop. Plan: a std-only fixed worker pool (`pool.rs`, size =
+  `--io-threads`, default = `available_parallelism`); per-handle
+  `Arc<Mutex<OpenFile>>` so the slow data-path ops (`read`, `write`) run
+  on workers — cross-handle parallel, per-handle serial (protects the
+  streaming seek cursor). Metadata ops stay on the dispatch thread, so the
+  inode/path maps need no locking (the outer `open_files` map is only ever
+  touched on the dispatch thread). `open`/`release`/`fsync` offload is a
+  documented follow-up. Latency/in-flight via an owned `OwnedOpScope`
+  (the existing `OpScope` borrows `&Stats` and can't cross threads).
+  Design: `docs/concurrency.md`. Acceptance (per #23): bigbust shows lower
+  p99 ttc + higher pods/sec, no data races.
 - [ ] (started 2026-05-21) Bring up single-node K8s on test1 with
   rspacefs as `mount_program`. Blocked on Fedora 42 reimage.
 - [ ] Stats wiring across FUSE ops.
