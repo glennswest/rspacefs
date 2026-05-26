@@ -20,6 +20,8 @@ mod kmsg;
 #[cfg(target_os = "linux")]
 mod metrics;
 #[cfg(target_os = "linux")]
+mod pool;
+#[cfg(target_os = "linux")]
 mod stats;
 
 #[cfg(target_os = "linux")]
@@ -626,6 +628,15 @@ mod linux_main {
         /// wants a flattened view.
         #[arg(long, value_name = "KEEP_TOP", num_args = 0..=1, default_missing_value = "0")]
         squash_lowers: Option<usize>,
+
+        /// Size of the worker pool that runs the blocking data-path ops
+        /// (`read`, `write`) off the single fuser dispatch thread. `0`
+        /// (the default) means auto = one worker per available CPU. fuser's
+        /// receive loop stays single-threaded by design; this is the pool
+        /// that lets a slow read on one container's file not stall every
+        /// other op on the same daemon. See `docs/concurrency.md` and #23.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        io_threads: usize,
     }
 
     pub fn run() -> Result<()> {
@@ -737,7 +748,8 @@ mod linux_main {
             layered_root.clone(),
             physical_layers.clone(),
             verified_layers.clone(),
-        );
+        )
+        .with_io_threads(cli.io_threads);
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName(cli.name.clone()),

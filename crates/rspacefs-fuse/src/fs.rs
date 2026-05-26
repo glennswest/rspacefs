@@ -41,7 +41,8 @@ use fuser::{
 use libc::{EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTEMPTY};
 use vfs::{VfsFileType, VfsPath};
 
-use crate::stats::{Op, Stats};
+use crate::pool::ThreadPool;
+use crate::stats::{Op, OwnedOpScope, Stats};
 
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
@@ -74,8 +75,17 @@ pub struct RspacefsFuse {
     next_ino: u64,
     /// monotonic file-handle allocator.
     next_fh: AtomicU64,
-    /// open file table: fh → cached content + dirty flag.
-    open_files: HashMap<u64, OpenFile>,
+    /// open file table: fh → per-handle state, each behind its own `Mutex`.
+    ///
+    /// The map itself is mutated only on the single `fuser::Session::run()`
+    /// dispatch thread (`open`/`create` insert, `release` removes), so the
+    /// outer map needs no lock. Each `OpenFile` is wrapped in `Arc<Mutex<…>>`
+    /// so the data-path ops (`read`/`write`) can clone the handle, hand it to
+    /// a worker thread, and do their (possibly slow) I/O off the dispatch
+    /// thread. The per-handle `Mutex` serializes ops on the *same* fh — which
+    /// protects the single seek cursor in `Streaming` — while ops on
+    /// *different* handles run fully in parallel. See `docs/concurrency.md`.
+    open_files: HashMap<u64, Arc<Mutex<OpenFile>>>,
     /// Per-inode BackingId cache. When the same file is opened by multiple
     /// containers / processes, we register ONE backing fd with the kernel
     /// (one `BACKING_OPEN` ioctl) and hand each opener a strong reference
@@ -96,6 +106,10 @@ pub struct RspacefsFuse {
     /// Shared operational counters. Cloned into the control thread so
     /// `stats` / `metrics-text` requests don't need to lock the FS.
     pub(crate) stats: Arc<Stats>,
+    /// Worker pool that runs the blocking data-path ops (`read`/`write`) off
+    /// the single fuser dispatch thread. Sized by `--io-threads`. See
+    /// `docs/concurrency.md` and issue #23.
+    pool: Arc<ThreadPool>,
 }
 
 /// Per-open-file state. Two flavors:
@@ -172,7 +186,18 @@ impl RspacefsFuse {
             fallback_gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
             stats,
+            pool: Arc::new(ThreadPool::new(default_io_threads())),
         }
+    }
+
+    /// Set the size of the data-path worker pool (`--io-threads`). `0` means
+    /// "auto" = `std::thread::available_parallelism()`. Builder-style so it
+    /// composes with `new`/`new_with_stats`; replaces the default pool built
+    /// by the constructor.
+    pub fn with_io_threads(mut self, n: usize) -> Self {
+        let n = if n == 0 { default_io_threads() } else { n };
+        self.pool = Arc::new(ThreadPool::new(n));
+        self
     }
 
     /// Public accessor for callers (the control thread) that need a
@@ -390,6 +415,56 @@ pub fn panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "<non-string panic payload>".into()
+    }
+}
+
+/// Default size of the data-path worker pool when `--io-threads` is unset
+/// (or `0`): one worker per available CPU, falling back to 4 if the platform
+/// won't report.
+fn default_io_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Worker-thread counterpart of the [`protect!`] macro. Runs `f` (the offloaded
+/// op body) under `catch_unwind`; on panic, bumps `faults_panic`, emits a
+/// structured fault event, and lets the dropped `reply` inside `f` fall through
+/// to fuser's default ENOSYS reply. A panic in one offloaded op stays contained
+/// to that op — the pool worker survives and keeps serving.
+fn run_protected(stats: &Arc<Stats>, op: &str, f: impl FnOnce()) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Err(p) = result {
+        let msg = panic_msg(p);
+        stats.faults_panic.fetch_add(1, Ordering::Relaxed);
+        crate::fault(
+            crate::kmsg::Prio::Err,
+            "op_panic",
+            &format!("op={op} panic={msg}"),
+        );
+    }
+}
+
+/// Lock a per-handle `OpenFile` mutex, recovering from poisoning rather than
+/// propagating it. A worker that panicked while holding the lock poisons it;
+/// recovering via `into_inner()` keeps the handle usable (degraded) instead of
+/// turning every subsequent op on it into a hard error. Bumps
+/// `faults_lock_poisoned` and emits a fault so the event is visible.
+fn lock_handle<'a>(
+    handle: &'a Arc<Mutex<OpenFile>>,
+    stats: &Arc<Stats>,
+) -> std::sync::MutexGuard<'a, OpenFile> {
+    match handle.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            stats.faults_lock_poisoned.fetch_add(1, Ordering::Relaxed);
+            crate::fault(
+                crate::kmsg::Prio::Warn,
+                "lock_poisoned",
+                "recovered a poisoned OpenFile mutex",
+            );
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -765,12 +840,12 @@ impl Filesystem for RspacefsFuse {
                 self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                 self.open_files.insert(
                     fh,
-                    OpenFile::Buffered {
+                    Arc::new(Mutex::new(OpenFile::Buffered {
                         path,
                         data,
                         dirty: false,
                         writable: true,
-                    },
+                    })),
                 );
                 return reply.opened(fh, 0);
             }
@@ -800,8 +875,10 @@ impl Filesystem for RspacefsFuse {
                         self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
                         self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                         reply.opened_passthrough(fh, 0, &backing);
-                        self.open_files
-                            .insert(fh, OpenFile::Passthrough { _backing: backing });
+                        self.open_files.insert(
+                            fh,
+                            Arc::new(Mutex::new(OpenFile::Passthrough { _backing: backing })),
+                        );
                         return;
                     }
                     // Cache miss — try to open + register a fresh backing.
@@ -817,8 +894,12 @@ impl Filesystem for RspacefsFuse {
                                 self.stats.passthrough_opens.fetch_add(1, Ordering::Relaxed);
                                 self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
                                 reply.opened_passthrough(fh, 0, &backing);
-                                self.open_files
-                                    .insert(fh, OpenFile::Passthrough { _backing: backing });
+                                self.open_files.insert(
+                                    fh,
+                                    Arc::new(Mutex::new(OpenFile::Passthrough {
+                                        _backing: backing,
+                                    })),
+                                );
                                 return;
                             }
                             Err(e) => {
@@ -847,7 +928,8 @@ impl Filesystem for RspacefsFuse {
                 Ok(reader) => {
                     self.stats.streaming_opens.fetch_add(1, Ordering::Relaxed);
                     self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
-                    self.open_files.insert(fh, OpenFile::Streaming { reader });
+                    self.open_files
+                        .insert(fh, Arc::new(Mutex::new(OpenFile::Streaming { reader })));
                     reply.opened(fh, 0);
                 }
                 Err(_) => reply.error(EIO),
@@ -866,48 +948,61 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let _scope = self.stats.scope(Op::Read);
-        crate::protect!(self, "read", {
-            let Some(file) = self.open_files.get_mut(&fh) else {
+        // Offloaded to the worker pool so a slow read (cold page cache, or a
+        // verity block that must be hashed) doesn't stall the single fuser
+        // dispatch thread. The latency guard is *owned* so it rides into the
+        // worker and drops there — recording full op latency, queue time
+        // included, when the reply is actually sent. See `docs/concurrency.md`.
+        let scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Read);
+        let stats = Arc::clone(&self.stats);
+        let handle = match self.open_files.get(&fh) {
+            Some(h) => Arc::clone(h),
+            None => {
                 self.stats.record(Op::Read, ino, 0, EBADF);
                 return reply.error(EBADF);
-            };
-            match file {
-                // Kernel should be serving these directly via passthrough; if we
-                // see a read on a passthrough handle something has slipped.
-                OpenFile::Passthrough { .. } => {
-                    self.stats.record(Op::Read, ino, 0, EIO);
-                    reply.error(EIO)
-                }
-                OpenFile::Streaming { reader } => {
-                    if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
-                        self.stats.record(Op::Read, ino, 0, EIO);
-                        return reply.error(EIO);
-                    }
-                    let mut buf = vec![0u8; size as usize];
-                    match reader.read(&mut buf) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            self.stats.record(Op::Read, ino, n as u64, 0);
-                            reply.data(&buf);
-                        }
-                        Err(_) => {
-                            self.stats.record(Op::Read, ino, 0, EIO);
-                            reply.error(EIO)
-                        }
-                    }
-                }
-                OpenFile::Buffered { data, .. } => {
-                    let start = offset as usize;
-                    if start >= data.len() {
-                        self.stats.record(Op::Read, ino, 0, 0);
-                        return reply.data(&[]);
-                    }
-                    let end = (start + size as usize).min(data.len());
-                    self.stats.record(Op::Read, ino, (end - start) as u64, 0);
-                    reply.data(&data[start..end]);
-                }
             }
+        };
+        self.pool.execute(move || {
+            let _scope = scope;
+            run_protected(&stats, "read", || {
+                let mut guard = lock_handle(&handle, &stats);
+                match &mut *guard {
+                    // Kernel should be serving these directly via passthrough; if
+                    // we see a read on a passthrough handle something has slipped.
+                    OpenFile::Passthrough { .. } => {
+                        stats.record(Op::Read, ino, 0, EIO);
+                        reply.error(EIO);
+                    }
+                    OpenFile::Streaming { reader } => {
+                        if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
+                            stats.record(Op::Read, ino, 0, EIO);
+                            return reply.error(EIO);
+                        }
+                        let mut buf = vec![0u8; size as usize];
+                        match reader.read(&mut buf) {
+                            Ok(n) => {
+                                buf.truncate(n);
+                                stats.record(Op::Read, ino, n as u64, 0);
+                                reply.data(&buf);
+                            }
+                            Err(_) => {
+                                stats.record(Op::Read, ino, 0, EIO);
+                                reply.error(EIO);
+                            }
+                        }
+                    }
+                    OpenFile::Buffered { data, .. } => {
+                        let start = offset as usize;
+                        if start >= data.len() {
+                            stats.record(Op::Read, ino, 0, 0);
+                            return reply.data(&[]);
+                        }
+                        let end = (start + size as usize).min(data.len());
+                        stats.record(Op::Read, ino, (end - start) as u64, 0);
+                        reply.data(&data[start..end]);
+                    }
+                }
+            });
         });
     }
 
@@ -923,38 +1018,50 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let _scope = self.stats.scope(Op::Write);
-        crate::protect!(self, "write", {
-            let Some(file) = self.open_files.get_mut(&fh) else {
+        // Offloaded like `read`. `data` borrows the kernel request buffer
+        // (not `'static`), so copy it to an owned Vec before handing it to a
+        // worker. See `docs/concurrency.md`.
+        let scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Write);
+        let stats = Arc::clone(&self.stats);
+        let handle = match self.open_files.get(&fh) {
+            Some(h) => Arc::clone(h),
+            None => {
                 self.stats.record(Op::Write, ino, 0, EBADF);
                 return reply.error(EBADF);
-            };
-            match file {
-                OpenFile::Passthrough { .. } | OpenFile::Streaming { .. } => {
-                    self.stats.record(Op::Write, ino, 0, libc::EACCES);
-                    reply.error(libc::EACCES)
-                }
-                OpenFile::Buffered {
-                    data: buf,
-                    dirty,
-                    writable,
-                    ..
-                } => {
-                    if !*writable {
-                        self.stats.record(Op::Write, ino, 0, libc::EACCES);
-                        return reply.error(libc::EACCES);
-                    }
-                    let off = offset as usize;
-                    let end = off + data.len();
-                    if end > buf.len() {
-                        buf.resize(end, 0);
-                    }
-                    buf[off..end].copy_from_slice(data);
-                    *dirty = true;
-                    self.stats.record(Op::Write, ino, data.len() as u64, 0);
-                    reply.written(data.len() as u32);
-                }
             }
+        };
+        let data = data.to_vec();
+        self.pool.execute(move || {
+            let _scope = scope;
+            run_protected(&stats, "write", || {
+                let mut guard = lock_handle(&handle, &stats);
+                match &mut *guard {
+                    OpenFile::Passthrough { .. } | OpenFile::Streaming { .. } => {
+                        stats.record(Op::Write, ino, 0, libc::EACCES);
+                        reply.error(libc::EACCES);
+                    }
+                    OpenFile::Buffered {
+                        data: buf,
+                        dirty,
+                        writable,
+                        ..
+                    } => {
+                        if !*writable {
+                            stats.record(Op::Write, ino, 0, libc::EACCES);
+                            return reply.error(libc::EACCES);
+                        }
+                        let off = offset as usize;
+                        let end = off + data.len();
+                        if end > buf.len() {
+                            buf.resize(end, 0);
+                        }
+                        buf[off..end].copy_from_slice(&data);
+                        *dirty = true;
+                        stats.record(Op::Write, ino, data.len() as u64, 0);
+                        reply.written(data.len() as u32);
+                    }
+                }
+            });
         });
     }
 
@@ -975,15 +1082,19 @@ impl Filesystem for RspacefsFuse {
             let Some(file) = self.open_files.remove(&fh) else {
                 return reply.error(EBADF);
             };
-            match file {
+            // The kernel doesn't send ops on a handle after release, so this is
+            // normally the last Arc to the handle. Lock (rather than unwrap the
+            // Arc) so we stay correct even if a stray worker still holds a clone.
+            let mut guard = lock_handle(&file, &self.stats);
+            match &mut *guard {
                 // Drop on BackingId fires BACKING_CLOSE in the kernel.
                 OpenFile::Passthrough { .. } => reply.ok(),
                 OpenFile::Streaming { .. } => reply.ok(),
                 OpenFile::Buffered {
                     path, data, dirty, ..
                 } => {
-                    if dirty {
-                        let p = match self.root.join(&path) {
+                    if *dirty {
+                        let p = match self.root.join(path) {
                             Ok(v) => v,
                             Err(_) => return reply.error(EIO),
                         };
@@ -991,7 +1102,7 @@ impl Filesystem for RspacefsFuse {
                             Ok(w) => w,
                             Err(_) => return reply.error(EIO),
                         };
-                        if w.write_all(&data).is_err() || w.flush().is_err() {
+                        if w.write_all(data).is_err() || w.flush().is_err() {
                             return reply.error(EIO);
                         }
                     }
@@ -1049,12 +1160,12 @@ impl Filesystem for RspacefsFuse {
             self.stats.open_handles.fetch_add(1, Ordering::Relaxed);
             self.open_files.insert(
                 fh,
-                OpenFile::Buffered {
+                Arc::new(Mutex::new(OpenFile::Buffered {
                     path,
                     data: Vec::new(),
                     dirty: false,
                     writable: true,
-                },
+                })),
             );
             reply.created(&TTL, &attr, 0, fh, 0);
         });
@@ -1375,10 +1486,11 @@ impl Filesystem for RspacefsFuse {
             // For Buffered (writable) handles: flush in-memory dirty data to
             // the upper file now. Streaming (read-only) handles have nothing
             // to sync — return OK.
-            let Some(file) = self.open_files.get_mut(&fh) else {
+            let Some(file) = self.open_files.get(&fh).map(Arc::clone) else {
                 return reply.error(EBADF);
             };
-            match file {
+            let mut guard = lock_handle(&file, &self.stats);
+            match &mut *guard {
                 OpenFile::Passthrough { .. } => reply.ok(),
                 OpenFile::Streaming { .. } => reply.ok(),
                 OpenFile::Buffered {

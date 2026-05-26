@@ -21,7 +21,7 @@
 //! data is the primitive.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -478,6 +478,44 @@ pub struct OpScope<'a> {
 }
 
 impl<'a> Drop for OpScope<'a> {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        let h = self.stats.hist_for(self.op);
+        h.observe(elapsed_us);
+        h.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Owned counterpart of [`OpScope`] for ops that finish on a worker thread.
+///
+/// `OpScope` borrows `&Stats`, so it can't outlive the borrow or cross a
+/// thread boundary. The concurrent data-path ops (`read`, `write`) hand their
+/// work to the thread pool (see `docs/concurrency.md`), so the latency guard
+/// has to ride along into the worker and drop there — when the reply is
+/// actually sent. This variant owns an `Arc<Stats>` to make that possible.
+///
+/// Same semantics: increments in-flight on construction, and on drop records
+/// elapsed latency into the per-op histogram + decrements in-flight. So the
+/// recorded latency spans the whole op including time spent queued in the
+/// pool — which is exactly the figure we want for p99 time-to-completion.
+pub struct OwnedOpScope {
+    stats: Arc<Stats>,
+    op: Op,
+    started: Instant,
+}
+
+impl OwnedOpScope {
+    pub fn new(stats: Arc<Stats>, op: Op) -> Self {
+        stats.hist_for(op).in_flight.fetch_add(1, Ordering::Relaxed);
+        OwnedOpScope {
+            stats,
+            op,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for OwnedOpScope {
     fn drop(&mut self) {
         let elapsed_us = self.started.elapsed().as_micros() as u64;
         let h = self.stats.hist_for(self.op);
