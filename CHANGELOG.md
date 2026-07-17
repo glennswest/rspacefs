@@ -1,9 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [v0.3.0] — 2026-07-17
 
 ### 2026-07-17
 - **feat (pvc):** **Data-PVC mode end-to-end** (refs #12). `rspacefs-mount --pvc` mounts a PVC-shaped LayerFS — zero or more lowers (extracted dirs or tar/tar+zstd blobs), one writable upper — at a kubelet volume path, with `--owner`, read-only mode, and the same self-daemonizing contract as mount_program mode. New `rspacefs-pvc` modules: `blob.rs` (`apply_blob` tar+zstd extraction into a lower dir) and `swap.rs` (`SwappableRoot` — a swappable merged root enabling **live** `pivot_upper`, tmpfs → disk promotion without remount). Control socket gains `pivot-upper` and `capture-layer` (deterministic tar+zstd + sha256 snapshot of the upper); `rspacefs pvc {init,apply,capture}` CLI subcommands plus matching `ctl` verbs. New metrics `rspacefs_pivots_total` / `rspacefs_captures_total`. Zero-lower LayerFS regression test in core, `crates/rspacefs-pvc/tests/roundtrip.rs` integration test, `docs/pvc.md` usage doc, `enhancements/rspacefs-csi.md` follow-up design. Compiled/tested on dev.g8.lo. Follow-ups: lazy blob extraction, per-entry owner attrs, rspacefs-csi.
+- **fix (fuse):** Linux build repaired (#27). The #23 commit left 21 op handlers holding a borrowing `OpScope` (`&Stats`) across the `protect!` closure that mutably captures the adapter — 9× E0500 on every Linux build, masked by the macOS stub. All handlers now use the owned `OwnedOpScope` (identical telemetry); the borrowing `OpScope` is removed. The four `faults_*` counters are now actually exported in the `stats` snapshot and as `rspacefs_faults_total{kind=...}` in Prometheus output (previously declared but never read — clippy caught it once the crate finally compiled on Linux).
 - **fix (fuse):** Construct `RspacefsFuse` only **after** the daemonizing fork (#28). `RspacefsFuse::new` spawns the #23 data-path worker pool, and threads don't survive `fork()` — a pool built pre-fork left the child with a job queue nobody drains, hanging every read/write forever. `daemonize_after_mount` docs now state the callers-must-not-spawn-threads-first contract.
 
 ### 2026-05-25
