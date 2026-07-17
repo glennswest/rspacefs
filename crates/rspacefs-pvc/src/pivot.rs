@@ -71,11 +71,19 @@ pub fn pivot_upper(
     probe.create_dir().map_err(crate::PvcError::Vfs)?;
     probe.remove_dir().map_err(crate::PvcError::Vfs)?;
 
-    // Rebuild the LayerFS with new_upper while preserving lowers, then
-    // wrap as a fresh VfsPath. The old `merged` VfsPath is dropped; any
-    // VfsPath clones the caller still holds reference the old LayerFS
-    // (which keeps the old upper alive until the last clone goes).
-    pvc.merged = VfsPath::new(LayerFS::new(new_upper.clone(), pvc.lowers.clone()));
+    // Rebuild the LayerFS with new_upper while preserving lowers, and
+    // store it through the SwappableRoot handle. Every clone of
+    // `pvc.merged()` — including one a FUSE adapter captured at mount
+    // time — re-roots atomically onto the new upper. Readers/writers
+    // opened before the swap keep their boxed handles into the old
+    // LayerFS, which stays alive until the last one drops.
+    let new_root = VfsPath::new(LayerFS::new(new_upper.clone(), pvc.lowers.clone()));
+    {
+        let mut guard = pvc.root_handle.write().map_err(|_| {
+            crate::PvcError::InvalidArgument("pivot_upper: root handle lock poisoned".into())
+        })?;
+        *guard = new_root;
+    }
     pvc.upper = new_upper;
     pvc.upper_physical = new_upper_physical;
 
@@ -126,10 +134,24 @@ mod tests {
             .write_all(b"in upper A")
             .unwrap();
 
+        // Clone the merged view BEFORE the pivot — this simulates the
+        // FUSE adapter, which captures the merged VfsPath at mount time
+        // and never rebuilds it. The pivot must be visible through it.
+        let daemon_view = pvc.merged().clone();
+
         // Pivot to upper_b (empty).
         let upper_b = mem();
         let report = pivot_upper(&mut pvc, upper_b.clone(), None, Some(0)).unwrap();
         assert!(report.old_upper_kept);
+
+        // The pre-pivot clone re-roots too: seed.txt (lower) visible,
+        // upper A's file gone.
+        assert!(daemon_view.join("seed.txt").unwrap().exists().unwrap());
+        assert!(!daemon_view
+            .join("upper-only.txt")
+            .unwrap()
+            .exists()
+            .unwrap());
 
         // Through the new merged view: lower's seed.txt still visible,
         // but upper-only.txt (which was in upper_a) is gone.

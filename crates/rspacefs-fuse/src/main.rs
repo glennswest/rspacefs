@@ -245,8 +245,6 @@ mod linux_main {
         );
 
         let overlay = LayerFS::new(upper_vfs, lower_vfs);
-        let fs =
-            crate::fs::RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
 
         let mut opts: Vec<MountOption> = vec![
             MountOption::FSName("rspacefs".to_string()),
@@ -276,6 +274,13 @@ mod linux_main {
         // the parent polls the mountpoint and exits 0 when the FUSE mount
         // shows up; the child detaches and runs the FUSE event loop forever.
         daemonize_after_mount(&mountpoint).context("daemonize")?;
+
+        // Construct the FUSE adapter only AFTER the fork: RspacefsFuse::new
+        // spawns the #23 data-path worker pool, and threads don't survive
+        // fork() — a pool built pre-fork leaves the child with a job queue
+        // nobody drains, hanging every read/write forever (#28).
+        let fs =
+            crate::fs::RspacefsFuse::new(VfsPath::new(overlay), physical_layers, verified_layers);
 
         // Hardening (#22 / #24): run the FUSE session inside a panic-catching
         // shell so any unexpected panic in a handler doesn't drop us out
@@ -361,10 +366,12 @@ mod linux_main {
     fn daemonize_after_mount(mountpoint: &std::path::Path) -> Result<()> {
         use std::time::{Duration, Instant};
 
-        // Forking with live threads is undefined behaviour. We must fork
-        // before fuser spawns any worker threads — which is fine: at this
-        // point we've only built clap output, the FUSE session is created
-        // by mount2() *after* this returns.
+        // Forking with live threads loses every thread but the caller in
+        // the child. Callers MUST NOT construct RspacefsFuse (which
+        // spawns the #23 data-path worker pool), the control-socket
+        // thread, or the metrics listener before calling this — see #28.
+        // The FUSE session itself is created by mount2()/Session::new
+        // *after* this returns, in the child.
 
         unsafe {
             let pid = libc::fork();
@@ -514,6 +521,334 @@ mod linux_main {
                rspacefs-mount --upper DIR --lower DIR... [--lower-verified-pinned DIR=MFS=TREE] MOUNTPOINT\n\
             "
         );
+    }
+
+    // ── PVC mount mode ──────────────────────────────────────────────────
+    //
+    // `rspacefs-mount --pvc` mounts a PVC-shaped LayerFS: zero or more
+    // lowers (pulled registry blobs or extracted dirs), one writable
+    // upper (tmpfs or disk), FUSE-mounted at a kubelet volume path. The
+    // control socket additionally speaks `pivot-upper` (tmpfs → disk
+    // promotion) and `capture-layer` (snapshot upper into a
+    // registry-pushable tar+zstd). Design: enhancements/pvc-registry-content.md.
+
+    #[derive(Parser)]
+    #[command(
+        name = "rspacefs-mount",
+        version,
+        about = "Mount an rspacefs PVC (upper + optional blob lowers) at a FUSE mountpoint",
+        long_about = None
+    )]
+    struct PvcCli {
+        /// PVC mount mode selector (this flag is what routed argv here).
+        #[arg(long)]
+        pvc: bool,
+
+        /// PVC name — used in logs, blob-cache paths, capture filenames.
+        #[arg(long, default_value = "pvc")]
+        name: String,
+
+        /// Writable upper layer directory (tmpfs or disk; pre-created by
+        /// the caller).
+        #[arg(long)]
+        upper: PathBuf,
+
+        /// Lower layer, repeatable, order top-down. Each may be an
+        /// extracted directory (used as-is) or a tar / tar+zstd blob
+        /// (extracted into a per-mount cache dir at mount time). Zero
+        /// lowers = empty PVC.
+        #[arg(long = "lower-blob", value_name = "DIR|TARBALL")]
+        lower_blob: Vec<PathBuf>,
+
+        /// Accepted for mount_program argv symmetry; PVC copy-up goes
+        /// directly into the upper, so no workdir is needed.
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+
+        /// `uid:gid` to own the mount root (the workload's runAsUser).
+        /// Applied to the upper directory at mount time.
+        #[arg(long, value_name = "UID:GID", value_parser = parse_owner)]
+        owner: Option<(u32, u32)>,
+
+        /// Access mode: `empty` (scratch, zero lowers), `ro` (seed
+        /// content, never written), `rwo` (normal PVC), `rwx` (multi-
+        /// reader; caller coordinates).
+        #[arg(long, value_name = "MODE", default_value = "rwo")]
+        access_mode: String,
+
+        /// Lifecycle: `persistent`, `ephemeral`, or
+        /// `ephemeral-then-persistent` (upper starts on tmpfs, promoted
+        /// to disk later via the `pivot-upper` control op).
+        #[arg(long, value_name = "LIFECYCLE", default_value = "persistent")]
+        lifecycle: String,
+
+        /// Unix-socket control surface. Required for `pivot-upper` /
+        /// `capture-layer`; also serves the standard `status` /
+        /// `stats` / `invalidate` commands.
+        #[arg(long, value_name = "PATH")]
+        control_socket: Option<PathBuf>,
+
+        /// Optional `host:port` for the Prometheus `/metrics` endpoint.
+        #[arg(long, value_name = "HOST:PORT")]
+        metrics_addr: Option<String>,
+
+        /// Stay in the foreground instead of daemonizing after the
+        /// mount is established.
+        #[arg(long)]
+        foreground: bool,
+
+        /// Show debug-level FUSE op logs.
+        #[arg(long)]
+        debug: bool,
+
+        /// Log output format: auto | text | json | journald.
+        #[arg(long, value_name = "FMT", default_value = "auto")]
+        log_format: String,
+
+        /// Write fault-class events to /dev/kmsg (see the overlay mode
+        /// flag of the same name).
+        #[arg(long, default_value_t = true)]
+        kmsg_faults: bool,
+
+        /// Worker pool size for blocking data-path ops; 0 = auto.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        io_threads: usize,
+
+        /// Mountpoint (kubelet volume path; must exist).
+        mountpoint: PathBuf,
+    }
+
+    fn parse_owner(s: &str) -> Result<(u32, u32), String> {
+        let (uid, gid) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected UID:GID, got {:?}", s))?;
+        Ok((
+            uid.parse().map_err(|e| format!("bad uid {:?}: {e}", uid))?,
+            gid.parse().map_err(|e| format!("bad gid {:?}: {e}", gid))?,
+        ))
+    }
+
+    /// Cache dir for a lower blob that arrives as a tarball. Lives under
+    /// the runtime dir so a reboot clears it with the rest of /run.
+    fn pvc_blob_cache_dir(name: &str, idx: usize) -> PathBuf {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/run"));
+        base.join("rspacefs")
+            .join(format!("pvc-{}-{}-lower{}", name, std::process::id(), idx))
+    }
+
+    pub fn run_pvc(argv: &[std::ffi::OsString]) -> Result<()> {
+        let cli = PvcCli::parse_from(argv);
+        init_tracing(cli.debug, &cli.log_format);
+        crate::kmsg_faults_enabled::set(cli.kmsg_faults);
+
+        if !cli.upper.is_dir() {
+            bail!("upper is not a directory: {}", cli.upper.display());
+        }
+        if !cli.mountpoint.is_dir() {
+            bail!(
+                "mountpoint is not a directory: {}",
+                cli.mountpoint.display()
+            );
+        }
+        if let Some(w) = &cli.workdir {
+            tracing::debug!(workdir = %w.display(), "ignoring --workdir (PVC copy-up is direct)");
+        }
+
+        let access_mode = match cli.access_mode.as_str() {
+            "empty" => rspacefs_pvc::PvcAccessMode::Empty,
+            "ro" | "read-only" => rspacefs_pvc::PvcAccessMode::ReadOnly,
+            "rwo" | "read-write-once" => rspacefs_pvc::PvcAccessMode::ReadWriteOnce,
+            "rwx" | "rwm" | "read-write-many" => rspacefs_pvc::PvcAccessMode::ReadWriteMany,
+            other => bail!("unknown --access-mode {:?} (empty|ro|rwo|rwx)", other),
+        };
+        let lifecycle = match cli.lifecycle.as_str() {
+            "persistent" => rspacefs_pvc::PvcLifecycle::Persistent,
+            "ephemeral" => rspacefs_pvc::PvcLifecycle::Ephemeral,
+            "ephemeral-then-persistent" => rspacefs_pvc::PvcLifecycle::EphemeralThenPersistent,
+            other => bail!(
+                "unknown --lifecycle {:?} (persistent|ephemeral|ephemeral-then-persistent)",
+                other
+            ),
+        };
+
+        // Lowers: directories are used as-is; tarballs are extracted into
+        // a per-mount cache dir. Extraction is eager (full unpack at
+        // mount time) — lazy per-read extraction is a documented
+        // follow-up in the enhancement.
+        let mut lower_vfs: Vec<VfsPath> = Vec::new();
+        let mut lower_phys: Vec<PathBuf> = Vec::new();
+        for (i, blob) in cli.lower_blob.iter().enumerate() {
+            let dir = if blob.is_dir() {
+                blob.clone()
+            } else if blob.is_file() {
+                let cache = pvc_blob_cache_dir(&cli.name, i);
+                let report = rspacefs_pvc::apply_blob(blob, &cache)
+                    .map_err(|e| anyhow!("extracting --lower-blob {}: {e}", blob.display()))?;
+                tracing::info!(
+                    blob = %blob.display(),
+                    cache = %cache.display(),
+                    entries = report.entries,
+                    bytes = report.bytes_written,
+                    "extracted PVC lower blob"
+                );
+                cache
+            } else {
+                bail!(
+                    "--lower-blob {} is neither a directory nor a file",
+                    blob.display()
+                );
+            };
+            lower_vfs.push(VfsPath::new(PhysicalFS::new(dir.clone())));
+            lower_phys.push(dir);
+        }
+
+        // Ownership: hand the mount root to the workload's uid/gid so a
+        // non-root pod can write its own PVC. Root-of-tree only for now
+        // (files inherit via umask/fs behavior); per-entry attr override
+        // is a follow-up.
+        if let Some((uid, gid)) = cli.owner {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = std::ffi::CString::new(cli.upper.as_os_str().as_bytes()) {
+                // SAFETY: valid C string; chown is a plain syscall wrapper.
+                let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+                if rc != 0 {
+                    tracing::warn!(
+                        upper = %cli.upper.display(),
+                        error = %std::io::Error::last_os_error(),
+                        "chown of upper to --owner failed; continuing"
+                    );
+                }
+            }
+        }
+
+        let pvc = rspacefs_pvc::PvcMount::new(rspacefs_pvc::PvcOptions {
+            access_mode,
+            lifecycle,
+            name: cli.name.clone(),
+            upper: VfsPath::new(PhysicalFS::new(cli.upper.clone())),
+            lowers: lower_vfs,
+            owner: cli.owner,
+            upper_physical: Some(cli.upper.clone()),
+        })
+        .map_err(|e| anyhow!("constructing PVC mount: {e}"))?;
+
+        let mut physical_layers = vec![cli.upper.clone()];
+        physical_layers.extend(lower_phys.iter().cloned());
+        let verified_layers = vec![false; physical_layers.len()];
+
+        tracing::info!(
+            mountpoint = %cli.mountpoint.display(),
+            name = %cli.name,
+            upper = %cli.upper.display(),
+            lowers = lower_phys.len(),
+            access_mode = %cli.access_mode,
+            lifecycle = %cli.lifecycle,
+            "starting rspacefs FUSE mount (PVC mode)"
+        );
+
+        let merged = pvc.merged().clone();
+
+        let mut opts: Vec<MountOption> = vec![
+            MountOption::FSName("rspacefs".to_string()),
+            MountOption::Subtype("rspacefs".to_string()),
+            MountOption::DefaultPermissions,
+            // Pods run under arbitrary UIDs — same reasoning as
+            // mount_program mode.
+            MountOption::AllowOther,
+        ];
+        if access_mode == rspacefs_pvc::PvcAccessMode::ReadOnly {
+            opts.push(MountOption::RO);
+        }
+
+        // Same daemonization contract as mount_program mode: return once
+        // the kernel acknowledges the mount. Must happen before any
+        // threads exist — including the #23 worker pool that
+        // RspacefsFuse::new spawns (#28), so the adapter is constructed
+        // strictly after this fork.
+        if !cli.foreground {
+            daemonize_after_mount(&cli.mountpoint).context("daemonize")?;
+        }
+
+        let fs = RspacefsFuse::new(
+            merged.clone(),
+            physical_layers.clone(),
+            verified_layers.clone(),
+        )
+        .with_io_threads(cli.io_threads);
+
+        let stats = fs.stats();
+        if let Some(addr) = &cli.metrics_addr {
+            let _h = crate::metrics::spawn_metrics_server(
+                addr,
+                std::sync::Arc::clone(&stats),
+                cli.mountpoint.display().to_string(),
+            )
+            .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+        }
+
+        let mp = cli.mountpoint.clone();
+        match &cli.control_socket {
+            Some(sock_path) => {
+                let control_state = std::sync::Arc::new(crate::control::ControlState {
+                    mountpoint: cli.mountpoint.clone(),
+                    upper: cli.upper.clone(),
+                    lowers: lower_phys,
+                    verified_layers,
+                    mount_time: std::time::SystemTime::now(),
+                    root: merged,
+                    stats,
+                    pvc: Some(std::sync::Arc::new(std::sync::Mutex::new(pvc))),
+                });
+                let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
+                    .context("FUSE mount failed (need /dev/fuse access?)")?;
+                let notifier = session.notifier();
+                let _ctl = crate::control::spawn_control_thread(
+                    sock_path.clone(),
+                    control_state,
+                    notifier,
+                )
+                .context("failed to start control socket")?;
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.run()));
+                let _ = std::fs::remove_file(sock_path);
+                cleanup_mount_on_exit(&mp, None);
+                match res {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => {
+                        Err(anyhow::Error::new(e).context("FUSE session ended with error"))
+                    }
+                    Err(p) => {
+                        let msg = panic_msg(p);
+                        crate::fault(
+                            crate::kmsg::Prio::Err,
+                            "panic",
+                            &format!("FUSE session panicked; mount cleaned up: {msg}"),
+                        );
+                        bail!("FUSE session panicked: {msg}");
+                    }
+                }
+            }
+            None => {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fuser::mount2(fs, &cli.mountpoint, &opts)
+                        .context("FUSE mount failed (need /dev/fuse access?)")
+                }));
+                cleanup_mount_on_exit(&mp, None);
+                match res {
+                    Ok(r) => r,
+                    Err(p) => {
+                        let msg = panic_msg(p);
+                        crate::fault(
+                            crate::kmsg::Prio::Err,
+                            "panic",
+                            &format!("FUSE session panicked; mount cleaned up: {msg}"),
+                        );
+                        bail!("FUSE session panicked: {msg}");
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Parser)]
@@ -795,6 +1130,7 @@ mod linux_main {
                     mount_time: std::time::SystemTime::now(),
                     root: layered_root,
                     stats,
+                    pvc: None,
                 });
                 // Session::new gives us the same blocking se.run() as
                 // mount2() but lets us pull notifier() out first for the
@@ -911,9 +1247,17 @@ fn main() -> anyhow::Result<()> {
     // 1. If invoked with overlay-style `[-o lowerdir=...,upperdir=...,workdir=...] /mountpoint`,
     //    parse those options — this is the containers-storage `mount_program`
     //    contract used by podman / buildah / CRI-O on OpenShift etc.
-    // 2. Otherwise fall through to the native clap parser
+    // 2. If `--pvc` is present anywhere in argv, run in PVC mount mode
+    //    (explicit PVC mounts owned by a boot agent / operator / CSI
+    //    node plugin — zero-lower allowed, blob lowers, pivot/capture
+    //    control ops). Checked before the mount_program heuristic so a
+    //    PVC invocation can never be misparsed as an overlay one.
+    // 3. Otherwise fall through to the native clap parser
     //    (--upper / --lower / --lower-verified-pinned / mountpoint).
     let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw.iter().any(|a| a.to_str() == Some("--pvc")) {
+        return linux_main::run_pvc(&raw);
+    }
     if linux_main::looks_like_mount_program(&raw) {
         return linux_main::run_mount_program(&raw);
     }

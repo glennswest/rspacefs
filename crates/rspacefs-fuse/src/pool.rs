@@ -54,7 +54,9 @@ impl ThreadPool {
         }
     }
 
-    /// Number of worker threads.
+    /// Number of worker threads. Exercised by unit tests; kept public
+    /// for a future `debug` control-socket field.
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.workers.len()
     }

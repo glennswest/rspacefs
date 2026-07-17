@@ -41,6 +41,40 @@ enum Cmd {
         #[command(subcommand)]
         op: CtlOp,
     },
+    /// Offline PVC layer tools: scaffold, seed from a blob, capture to a
+    /// blob. No daemon involved — see `rspacefs ctl` for live-mount ops
+    /// and docs/pvc.md for the full lifecycle.
+    Pvc {
+        #[command(subcommand)]
+        op: PvcOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum PvcOp {
+    /// Create an empty PVC upper scaffold directory.
+    Init {
+        #[arg(long)]
+        upper: PathBuf,
+    },
+    /// Extract a pulled PVC blob (tar or tar+zstd) into a directory,
+    /// pre-staging it as an upper or as a lower seed.
+    Apply {
+        #[arg(long)]
+        upper: PathBuf,
+        #[arg(long)]
+        blob: PathBuf,
+    },
+    /// Capture an upper directory into a registry-pushable tar+zstd
+    /// blob and print the report (path, sha256 digest, size) as JSON.
+    Capture {
+        #[arg(long)]
+        upper: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 3)]
+        zstd_level: i32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -68,6 +102,23 @@ enum CtlOp {
     /// Internal-state dump for debugging: open handles, RSS, last-op
     /// timestamp, layer count.
     Debug,
+    /// PVC mounts only: promote the live mount's upper to a new backing
+    /// directory (tmpfs → disk). The new dir must be a pre-populated,
+    /// content-identical copy of the current upper.
+    PivotUpper {
+        #[arg(long, value_name = "DIR")]
+        new_upper: PathBuf,
+    },
+    /// PVC mounts only: snapshot the live mount's upper into a
+    /// deterministic tar+zstd blob; prints the digest report.
+    CaptureLayer {
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        #[arg(long)]
+        zstd_level: Option<i32>,
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,7 +187,72 @@ fn main() -> Result<()> {
         Cmd::Overlay { op } => run_overlay(op),
         Cmd::Verity { op } => run_verity(op),
         Cmd::Ctl { socket, op } => run_ctl(socket, op),
+        Cmd::Pvc { op } => run_pvc(op),
     }
+}
+
+// ── pvc: offline PVC layer tools ────────────────────────────────────────────
+
+fn run_pvc(op: PvcOp) -> Result<()> {
+    match op {
+        PvcOp::Init { upper } => {
+            fs::create_dir_all(&upper)
+                .with_context(|| format!("creating PVC upper at {}", upper.display()))?;
+            println!("initialized empty PVC upper at {}", upper.display());
+        }
+        PvcOp::Apply { upper, blob } => {
+            let report = rspacefs_pvc::apply_blob(&blob, &upper)
+                .map_err(|e| anyhow!("applying {}: {e}", blob.display()))?;
+            println!(
+                "applied {} entries ({} bytes) from {} into {}",
+                report.entries,
+                report.bytes_written,
+                blob.display(),
+                upper.display()
+            );
+        }
+        PvcOp::Capture {
+            upper,
+            out,
+            zstd_level,
+        } => {
+            if !upper.is_dir() {
+                bail!("upper is not a directory: {}", upper.display());
+            }
+            let pvc = rspacefs_pvc::PvcMount::new(rspacefs_pvc::PvcOptions {
+                access_mode: rspacefs_pvc::PvcAccessMode::ReadWriteOnce,
+                lifecycle: rspacefs_pvc::PvcLifecycle::Persistent,
+                name: upper
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "pvc".into()),
+                upper: VfsPath::new(PhysicalFS::new(upper.clone())),
+                lowers: vec![],
+                owner: None,
+                upper_physical: Some(upper),
+            })
+            .map_err(|e| anyhow!("constructing PVC over upper: {e}"))?;
+            let report = rspacefs_pvc::capture_layer(
+                &pvc,
+                rspacefs_pvc::CaptureOptions {
+                    out_path: out,
+                    zstd_level,
+                    since: None,
+                },
+            )
+            .map_err(|e| anyhow!("capture failed: {e}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "out_path": report.out_path,
+                    "digest": report.digest,
+                    "bytes_compressed": report.bytes_compressed,
+                    "entries": report.entries,
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── ctl: talk to a running rspacefs-mount daemon ────────────────────────────
@@ -158,6 +274,23 @@ fn run_ctl(socket: PathBuf, op: CtlOp) -> Result<()> {
         CtlOp::Info => r#"{"cmd":"info"}"#.into(),
         CtlOp::Ops { n } => format!(r#"{{"cmd":"ops","n":{}}}"#, n),
         CtlOp::Debug => r#"{"cmd":"debug"}"#.into(),
+        CtlOp::PivotUpper { new_upper } => {
+            serde_json::json!({"cmd": "pivot-upper", "new_upper": new_upper}).to_string()
+        }
+        CtlOp::CaptureLayer {
+            out,
+            zstd_level,
+            since,
+        } => {
+            let mut v = serde_json::json!({"cmd": "capture-layer", "out_path": out});
+            if let Some(level) = zstd_level {
+                v["zstd_level"] = level.into();
+            }
+            if let Some(s) = since {
+                v["since"] = s.into();
+            }
+            v.to_string()
+        }
     };
 
     let mut stream = UnixStream::connect(&socket)

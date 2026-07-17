@@ -30,3 +30,7 @@ fuser = { workspace = true }
 libc = { workspace = true }
 xattr = { workspace = true }
 tracing-journald = "0.3"
+# PVC primitives for `--pvc` mode + the pivot-upper / capture-layer
+# control ops. Pure library (no FUSE inside), but only the Linux daemon
+# path uses it, so keep it off the macOS stub build.
+rspacefs-pvc = { path = "../rspacefs-pvc" }

@@ -50,12 +50,14 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use anyhow::{anyhow, bail};
 use fuser::Notifier;
+use rspacefs_pvc::PvcMount;
 use serde::{Deserialize, Serialize};
-use vfs::VfsPath;
+use vfs::{PhysicalFS, VfsPath};
 
 use crate::stats::{render_prom, Stats};
 
@@ -77,6 +79,12 @@ pub struct ControlState {
     /// Operational counters and gauges. Cloned from the FS adapter at
     /// startup so `stats` / `metrics-text` / `ops` reads don't lock the FS.
     pub stats: Arc<Stats>,
+    /// Present only for `--pvc` mounts: the live PVC state that
+    /// `pivot-upper` and `capture-layer` operate on. The mutex
+    /// serializes those two ops against each other (quiesce-lite);
+    /// regular FUSE traffic proceeds through the SwappableRoot inside
+    /// `PvcMount::merged` and is never blocked by it.
+    pub pvc: Option<Arc<Mutex<PvcMount>>>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +113,27 @@ enum Request {
     /// Internal-state dump for debugging. Open-handle count, RSS bytes,
     /// last-op timestamp, layer count.
     Debug,
+    /// PVC mounts only: atomically swap the upper layer of the live
+    /// mount to a pre-populated, content-identical directory (the
+    /// tmpfs → disk promotion). See `enhancements/pvc-registry-content.md`.
+    PivotUpper {
+        new_upper: PathBuf,
+        #[serde(default = "default_true")]
+        preserve_open_files: bool,
+    },
+    /// PVC mounts only: snapshot the current upper into a deterministic
+    /// tar+zstd blob and return its sha256 digest.
+    CaptureLayer {
+        out_path: PathBuf,
+        #[serde(default)]
+        zstd_level: Option<i32>,
+        #[serde(default)]
+        since: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_ops_limit() -> usize {
@@ -123,6 +152,8 @@ struct Response<T: Serialize> {
 #[derive(Serialize)]
 struct StatusData {
     mountpoint: String,
+    /// "overlay" for rootfs mounts, "pvc" for --pvc mounts.
+    mode: &'static str,
     upper: String,
     lowers: Vec<LowerInfo>,
     uptime_secs: u64,
@@ -145,6 +176,7 @@ struct InvalidateData {
 #[derive(Serialize)]
 struct InfoData {
     mountpoint: String,
+    mode: &'static str,
     upper: String,
     lower_count: usize,
     verified_lower_count: usize,
@@ -253,7 +285,133 @@ fn dispatch(req: Request, state: &ControlState, notifier: &Notifier) -> String {
         Request::Info => to_ok(&info_payload(state)),
         Request::Ops { n } => to_ok(&state.stats.recent(n)),
         Request::Debug => to_ok(&debug_payload(state)),
+        Request::PivotUpper {
+            new_upper,
+            preserve_open_files,
+        } => match do_pivot_upper(state, notifier, new_upper, preserve_open_files) {
+            Ok(data) => to_ok(&data),
+            Err(e) => to_err(&e.to_string()),
+        },
+        Request::CaptureLayer {
+            out_path,
+            zstd_level,
+            since,
+        } => match do_capture_layer(state, out_path, zstd_level, since) {
+            Ok(data) => to_ok(&data),
+            Err(e) => to_err(&e.to_string()),
+        },
     }
+}
+
+#[derive(Serialize)]
+struct PivotData {
+    pivoted: bool,
+    /// Open FUSE handles at swap time. They keep reading the old upper's
+    /// backing files until closed; the caller (boot agent) tears down
+    /// the old tmpfs once this reaches zero (poll via `debug`).
+    old_upper_in_use_by_handles: i64,
+    /// Kernel dentry entries invalidated after the swap so lookups
+    /// re-enter the daemon and see the new upper.
+    entries_invalidated: usize,
+}
+
+#[derive(Serialize)]
+struct CaptureData {
+    out_path: String,
+    digest: String,
+    bytes_compressed: u64,
+    entries: usize,
+}
+
+fn do_pivot_upper(
+    state: &ControlState,
+    notifier: &Notifier,
+    new_upper: PathBuf,
+    preserve_open_files: bool,
+) -> anyhow::Result<PivotData> {
+    let pvc = state
+        .pvc
+        .as_ref()
+        .ok_or_else(|| anyhow!("pivot-upper is only available on --pvc mounts"))?;
+    if !preserve_open_files {
+        // Open handles ALWAYS survive on their old backing — there is no
+        // "close them out from under the workload" mode. Refuse rather
+        // than silently doing something the caller didn't ask for.
+        bail!("preserve_open_files=false is not supported; open handles always survive the swap");
+    }
+    if !new_upper.is_dir() {
+        bail!("new_upper is not a directory: {}", new_upper.display());
+    }
+
+    let handles = state
+        .stats
+        .open_handles
+        .load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut mount = pvc.lock().map_err(|_| anyhow!("PVC state lock poisoned"))?;
+        rspacefs_pvc::pivot_upper(
+            &mut mount,
+            VfsPath::new(PhysicalFS::new(new_upper.clone())),
+            Some(new_upper),
+            Some(handles.max(0) as usize),
+        )
+        .map_err(|e| anyhow!("pivot failed: {e}"))?;
+    }
+    state
+        .stats
+        .pivots
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::fault(
+        crate::kmsg::Prio::Info,
+        "pvc-pivot",
+        &format!("upper pivoted on {}", state.mountpoint.display()),
+    );
+
+    // Drop the kernel's dentry cache so the next lookup of every
+    // top-level name re-enters the daemon and resolves via the new upper.
+    let entries_invalidated = do_invalidate(state, notifier)
+        .map(|d| d.entries_invalidated)
+        .unwrap_or(0);
+
+    Ok(PivotData {
+        pivoted: true,
+        old_upper_in_use_by_handles: handles,
+        entries_invalidated,
+    })
+}
+
+fn do_capture_layer(
+    state: &ControlState,
+    out_path: PathBuf,
+    zstd_level: Option<i32>,
+    since: Option<String>,
+) -> anyhow::Result<CaptureData> {
+    let pvc = state
+        .pvc
+        .as_ref()
+        .ok_or_else(|| anyhow!("capture-layer is only available on --pvc mounts"))?;
+    let report = {
+        let mount = pvc.lock().map_err(|_| anyhow!("PVC state lock poisoned"))?;
+        rspacefs_pvc::capture_layer(
+            &mount,
+            rspacefs_pvc::CaptureOptions {
+                out_path,
+                zstd_level: zstd_level.unwrap_or(3),
+                since,
+            },
+        )
+        .map_err(|e| anyhow!("capture failed: {e}"))?
+    };
+    state
+        .stats
+        .captures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(CaptureData {
+        out_path: report.out_path.display().to_string(),
+        digest: report.digest,
+        bytes_compressed: report.bytes_compressed,
+        entries: report.entries,
+    })
 }
 
 fn info_payload(state: &ControlState) -> InfoData {
@@ -263,6 +421,7 @@ fn info_payload(state: &ControlState) -> InfoData {
         .unwrap_or_default();
     InfoData {
         mountpoint: state.mountpoint.display().to_string(),
+        mode: mode_str(state),
         upper: state.upper.display().to_string(),
         lower_count: state.lowers.len(),
         // verified_layers[0] is the upper — skip it for the lower count.
@@ -320,6 +479,7 @@ fn status_payload(state: &ControlState) -> StatusData {
         .collect();
     StatusData {
         mountpoint: state.mountpoint.display().to_string(),
+        mode: mode_str(state),
         upper: state.upper.display().to_string(),
         lowers,
         uptime_secs: state.mount_time.elapsed().map(|d| d.as_secs()).unwrap_or(0),
@@ -356,6 +516,14 @@ fn do_invalidate(state: &ControlState, notifier: &Notifier) -> std::io::Result<I
         entries_invalidated: names.len().saturating_sub(errors),
         errors,
     })
+}
+
+fn mode_str(state: &ControlState) -> &'static str {
+    if state.pvc.is_some() {
+        "pvc"
+    } else {
+        "overlay"
+    }
 }
 
 fn to_ok<T: Serialize>(v: &T) -> String {

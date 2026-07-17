@@ -531,7 +531,7 @@ impl Filesystem for RspacefsFuse {
     // ── Lookup / metadata ────────────────────────────────────────────────────
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let _scope = self.stats.scope(Op::Lookup);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Lookup);
         crate::protect!(self, "lookup", {
             self.stats.record(Op::Lookup, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -556,7 +556,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let _scope = self.stats.scope(Op::Getattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Getattr);
         crate::protect!(self, "getattr", {
             self.stats.record(Op::Getattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -588,7 +588,7 @@ impl Filesystem for RspacefsFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let _scope = self.stats.scope(Op::Setattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Setattr);
         crate::protect!(self, "setattr", {
             self.stats.record(Op::Setattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -674,7 +674,7 @@ impl Filesystem for RspacefsFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let _scope = self.stats.scope(Op::Readdir);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Readdir);
         crate::protect!(self, "readdir", {
             self.stats.record(Op::Readdir, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -745,7 +745,7 @@ impl Filesystem for RspacefsFuse {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let _scope = self.stats.scope(Op::Mkdir);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Mkdir);
         crate::protect!(self, "mkdir", {
             self.stats.record(Op::Mkdir, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -772,7 +772,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let _scope = self.stats.scope(Op::Rmdir);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Rmdir);
         crate::protect!(self, "rmdir", {
             self.stats.record(Op::Rmdir, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -806,7 +806,7 @@ impl Filesystem for RspacefsFuse {
     // ── Files ────────────────────────────────────────────────────────────────
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let _scope = self.stats.scope(Op::Open);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Open);
         crate::protect!(self, "open", {
             self.stats.record(Op::Open, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1075,7 +1075,7 @@ impl Filesystem for RspacefsFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let _scope = self.stats.scope(Op::Release);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Release);
         crate::protect!(self, "release", {
             self.stats.record(Op::Release, ino, 0, 0);
             self.stats.open_handles.fetch_sub(1, Ordering::Relaxed);
@@ -1122,7 +1122,7 @@ impl Filesystem for RspacefsFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let _scope = self.stats.scope(Op::Create);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Create);
         crate::protect!(self, "create", {
             self.stats.record(Op::Create, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -1172,7 +1172,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let _scope = self.stats.scope(Op::Unlink);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Unlink);
         crate::protect!(self, "unlink", {
             self.stats.record(Op::Unlink, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -1209,7 +1209,7 @@ impl Filesystem for RspacefsFuse {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let _scope = self.stats.scope(Op::Rename);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Rename);
         crate::protect!(self, "rename", {
             self.stats.record(Op::Rename, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -1265,7 +1265,7 @@ impl Filesystem for RspacefsFuse {
     // ── Symlinks ────────────────────────────────────────────────────────────
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let _scope = self.stats.scope(Op::Readlink);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Readlink);
         crate::protect!(self, "readlink", {
             self.stats.record(Op::Readlink, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1291,7 +1291,7 @@ impl Filesystem for RspacefsFuse {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        let _scope = self.stats.scope(Op::Symlink);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Symlink);
         crate::protect!(self, "symlink", {
             self.stats.record(Op::Symlink, parent, 0, 0);
             let parent_path = match self.path_of(parent) {
@@ -1341,7 +1341,7 @@ impl Filesystem for RspacefsFuse {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let _scope = self.stats.scope(Op::Getxattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Getxattr);
         crate::protect!(self, "getxattr", {
             self.stats.record(Op::Getxattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1369,7 +1369,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-        let _scope = self.stats.scope(Op::Listxattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Listxattr);
         crate::protect!(self, "listxattr", {
             self.stats.record(Op::Listxattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1411,7 +1411,7 @@ impl Filesystem for RspacefsFuse {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let _scope = self.stats.scope(Op::Setxattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Setxattr);
         crate::protect!(self, "setxattr", {
             self.stats.record(Op::Setxattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1431,7 +1431,7 @@ impl Filesystem for RspacefsFuse {
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
-        let _scope = self.stats.scope(Op::Removexattr);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Removexattr);
         crate::protect!(self, "removexattr", {
             self.stats.record(Op::Removexattr, ino, 0, 0);
             let path = match self.path_of(ino) {
@@ -1461,7 +1461,7 @@ impl Filesystem for RspacefsFuse {
         _flags: u32,
         reply: ReplyPoll,
     ) {
-        let _scope = self.stats.scope(Op::Poll);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Poll);
         crate::protect!(self, "poll", {
             self.stats.record(Op::Poll, ino, 0, 0);
             // Regular files and directories on a plain filesystem are *always*
@@ -1480,7 +1480,7 @@ impl Filesystem for RspacefsFuse {
     // ── Durable writes ──────────────────────────────────────────────────────
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        let _scope = self.stats.scope(Op::Fsync);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Fsync);
         crate::protect!(self, "fsync", {
             self.stats.record(Op::Fsync, ino, 0, 0);
             // For Buffered (writable) handles: flush in-memory dirty data to
@@ -1525,7 +1525,7 @@ impl Filesystem for RspacefsFuse {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        let _scope = self.stats.scope(Op::Flush);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Flush);
         crate::protect!(self, "flush", {
             self.stats.record(Op::Flush, ino, 0, 0);
             // Per POSIX: close() may flush; the kernel calls flush per close.
@@ -1539,7 +1539,7 @@ impl Filesystem for RspacefsFuse {
     // ── Statfs ──────────────────────────────────────────────────────────────
 
     fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
-        let _scope = self.stats.scope(Op::Statfs);
+        let _scope = OwnedOpScope::new(Arc::clone(&self.stats), Op::Statfs);
         crate::protect!(self, "statfs", {
             self.stats.record(Op::Statfs, ino, 0, 0);
             // Synthesised — we don't know the underlying disk's real numbers

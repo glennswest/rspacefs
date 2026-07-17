@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "rspacefs-bigbust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1414,11 +1414,12 @@ dependencies = [
 
 [[package]]
 name = "rspacefs-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "rspacefs-core",
+ "rspacefs-pvc",
  "rspacefs-verity",
  "serde_json",
  "vfs",
@@ -1426,20 +1427,21 @@ dependencies = [
 
 [[package]]
 name = "rspacefs-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "vfs",
 ]
 
 [[package]]
 name = "rspacefs-fuse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "fuser",
  "libc",
  "rspacefs-core",
+ "rspacefs-pvc",
  "rspacefs-verity",
  "serde",
  "serde_json",
@@ -1452,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "rspacefs-pvc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "rspacefs-core",
@@ -1469,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "rspacefs-verity"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rspacefs-core",
  "serde",

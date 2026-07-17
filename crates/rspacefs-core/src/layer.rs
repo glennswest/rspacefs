@@ -619,6 +619,43 @@ mod tests {
 
     // ── Basic resolution ──────────────────────────────────────────
 
+    /// PVC mode (enhancements/pvc-registry-content.md): an empty PVC is
+    /// a LayerFS with ZERO lowers — just a writable upper. Every
+    /// resolution path must tolerate the empty lower vec: no panics in
+    /// readdir, whiteout probes, or copy-up.
+    #[test]
+    fn test_zero_lower_layers_just_upper() {
+        let upper = VfsPath::new(MemoryFS::new());
+        let ov = VfsPath::new(LayerFS::new(upper, vec![]));
+
+        // Root readdir on a brand-new empty PVC: no entries, no panic.
+        assert_eq!(readdir_names(&ov).len(), 0);
+
+        // Writes land in the upper and read back through the merged view.
+        ov.join("data").unwrap().create_dir().unwrap();
+        ov.join("data/file.txt")
+            .unwrap()
+            .create_file()
+            .unwrap()
+            .write_all(b"scratch")
+            .unwrap();
+        let mut buf = String::new();
+        ov.join("data/file.txt")
+            .unwrap()
+            .open_file()
+            .unwrap()
+            .read_to_string(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "scratch");
+        assert_eq!(readdir_names(&ov), vec!["data".to_string()]);
+
+        // Metadata, existence, and removal all work without lowers.
+        assert!(ov.join("data/file.txt").unwrap().exists().unwrap());
+        assert!(!ov.join("missing").unwrap().exists().unwrap());
+        ov.join("data/file.txt").unwrap().remove_file().unwrap();
+        assert!(!ov.join("data/file.txt").unwrap().exists().unwrap());
+    }
+
     #[test]
     fn test_read_from_lower() {
         let ov = make_overlay();

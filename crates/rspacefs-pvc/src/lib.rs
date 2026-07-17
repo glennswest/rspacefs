@@ -22,12 +22,15 @@
 //! See `../../enhancements/pvc-registry-content.md` for the full design
 //! and the cross-project contracts.
 
+pub mod blob;
 pub mod capture;
 pub mod mount;
 pub mod pivot;
+mod swap;
 
+pub use blob::{apply_blob, ApplyReport};
 pub use capture::{capture_layer, CaptureOptions, CaptureReport};
-pub use mount::{PvcMount, PvcOptions};
+pub use mount::{PvcAccessMode, PvcLifecycle, PvcMount, PvcOptions};
 pub use pivot::{pivot_upper, PivotReport};
 
 use thiserror::Error;

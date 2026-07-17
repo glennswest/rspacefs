@@ -76,6 +76,10 @@ pub struct Stats {
     pub last_op_unix_ms: AtomicU64,
     /// Current number of file handles in the open table (gauge).
     pub open_handles: AtomicI64,
+    /// PVC mode: completed `pivot-upper` control ops (tmpfs → disk
+    /// upper promotions) and `capture-layer` snapshots.
+    pub pivots: AtomicU64,
+    pub captures: AtomicU64,
     /// Ring buffer of recent ops for the `ops` view.
     recent: Mutex<RecentRing>,
 }
@@ -274,6 +278,8 @@ impl Stats {
             faults_unexpected_errno: 0.into(),
             last_op_unix_ms: 0.into(),
             open_handles: 0.into(),
+            pivots: 0.into(),
+            captures: 0.into(),
             recent: Mutex::new(RecentRing::new(128)),
         }
     }
@@ -383,11 +389,17 @@ impl Stats {
             reflinks_fallback: self.reflinks_fallback.load(Ordering::Relaxed),
             backing_cache_hits: self.backing_cache_hits.load(Ordering::Relaxed),
             backing_cache_misses: self.backing_cache_misses.load(Ordering::Relaxed),
+            faults_panic: self.faults_panic.load(Ordering::Relaxed),
+            faults_session_retry: self.faults_session_retry.load(Ordering::Relaxed),
+            faults_lock_poisoned: self.faults_lock_poisoned.load(Ordering::Relaxed),
+            faults_unexpected_errno: self.faults_unexpected_errno.load(Ordering::Relaxed),
             errors_io: self.errors_io.load(Ordering::Relaxed),
             errors_enoent: self.errors_enoent.load(Ordering::Relaxed),
             errors_other: self.errors_other.load(Ordering::Relaxed),
             last_op_unix_ms: self.last_op_unix_ms.load(Ordering::Relaxed),
             open_handles: self.open_handles.load(Ordering::Relaxed),
+            pivots: self.pivots.load(Ordering::Relaxed),
+            captures: self.captures.load(Ordering::Relaxed),
         }
     }
 
@@ -396,18 +408,6 @@ impl Stats {
             .lock()
             .map(|r| r.collect(max))
             .unwrap_or_default()
-    }
-
-    /// Start timing one op. Returned guard increments in-flight on
-    /// construction and, on drop, records the elapsed latency into the
-    /// per-op histogram + decrements in-flight.
-    pub fn scope(&self, op: Op) -> OpScope<'_> {
-        self.hist_for(op).in_flight.fetch_add(1, Ordering::Relaxed);
-        OpScope {
-            stats: self,
-            op,
-            started: Instant::now(),
-        }
     }
 
     pub fn hist_for(&self, op: Op) -> &LatHist {
@@ -467,37 +467,18 @@ impl Stats {
     }
 }
 
-/// RAII guard returned by `Stats::scope`. Increments in-flight on
-/// construction and on drop records the elapsed latency into the per-op
-/// histogram + decrements in-flight. One line at the top of each FUSE op
-/// method is all that's needed.
-pub struct OpScope<'a> {
-    stats: &'a Stats,
-    op: Op,
-    started: Instant,
-}
-
-impl<'a> Drop for OpScope<'a> {
-    fn drop(&mut self) {
-        let elapsed_us = self.started.elapsed().as_micros() as u64;
-        let h = self.stats.hist_for(self.op);
-        h.observe(elapsed_us);
-        h.in_flight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// Owned counterpart of [`OpScope`] for ops that finish on a worker thread.
+/// RAII latency guard for FUSE ops. Owns an `Arc<Stats>` so it can be
+/// held across a `protect!` closure (which mutably captures the adapter)
+/// and can ride into a worker thread for the pooled data-path ops
+/// (`read`, `write` — see `docs/concurrency.md`), dropping when the
+/// reply is actually sent.
 ///
-/// `OpScope` borrows `&Stats`, so it can't outlive the borrow or cross a
-/// thread boundary. The concurrent data-path ops (`read`, `write`) hand their
-/// work to the thread pool (see `docs/concurrency.md`), so the latency guard
-/// has to ride along into the worker and drop there — when the reply is
-/// actually sent. This variant owns an `Arc<Stats>` to make that possible.
-///
-/// Same semantics: increments in-flight on construction, and on drop records
-/// elapsed latency into the per-op histogram + decrements in-flight. So the
-/// recorded latency spans the whole op including time spent queued in the
-/// pool — which is exactly the figure we want for p99 time-to-completion.
+/// Increments in-flight on construction; on drop records elapsed latency
+/// into the per-op histogram + decrements in-flight. The recorded latency
+/// spans the whole op including time queued in the pool — exactly the
+/// figure we want for p99 time-to-completion. (A borrowing `OpScope`
+/// predecessor was removed in #27: holding a `&Stats` across `protect!`'s
+/// mutable self-capture didn't borrow-check.)
 pub struct OwnedOpScope {
     stats: Arc<Stats>,
     op: Op,
@@ -648,11 +629,17 @@ pub struct StatsSnapshot {
     pub reflinks_fallback: u64,
     pub backing_cache_hits: u64,
     pub backing_cache_misses: u64,
+    pub faults_panic: u64,
+    pub faults_session_retry: u64,
+    pub faults_lock_poisoned: u64,
+    pub faults_unexpected_errno: u64,
     pub errors_io: u64,
     pub errors_enoent: u64,
     pub errors_other: u64,
     pub last_op_unix_ms: u64,
     pub open_handles: i64,
+    pub pivots: u64,
+    pub captures: u64,
 }
 
 #[derive(Serialize)]
@@ -753,6 +740,16 @@ pub fn render_prom(snap: &StatsSnapshot, mountpoint: &str) -> String {
         "bytes accepted from clients via write()"
     );
     counter!(
+        "rspacefs_pivots_total",
+        snap.pivots,
+        "PVC pivot-upper promotions completed via the control socket"
+    );
+    counter!(
+        "rspacefs_captures_total",
+        snap.captures,
+        "PVC capture-layer snapshots completed via the control socket"
+    );
+    counter!(
         "rspacefs_passthrough_opens_total",
         snap.passthrough_opens,
         "opens served via FUSE_PASSTHROUGH (kernel-direct)"
@@ -811,6 +808,26 @@ pub fn render_prom(snap: &StatsSnapshot, mountpoint: &str) -> String {
         "rspacefs_errors_total{kind=\"other\"}",
         snap.errors_other,
         "other errno returned to client"
+    );
+    counter!(
+        "rspacefs_faults_total{kind=\"panic\"}",
+        snap.faults_panic,
+        "op panics caught and contained (docs/faults.md)"
+    );
+    counter!(
+        "rspacefs_faults_total{kind=\"session_retry\"}",
+        snap.faults_session_retry,
+        "FUSE session loop retries after transient errors"
+    );
+    counter!(
+        "rspacefs_faults_total{kind=\"lock_poisoned\"}",
+        snap.faults_lock_poisoned,
+        "poisoned mutexes recovered"
+    );
+    counter!(
+        "rspacefs_faults_total{kind=\"unexpected_errno\"}",
+        snap.faults_unexpected_errno,
+        "unexpected errnos coerced to EIO"
     );
     gauge!(
         "rspacefs_open_handles",
@@ -916,10 +933,10 @@ mod tests {
 
     #[test]
     fn op_scope_increments_and_decrements_in_flight() {
-        let s = Stats::new();
+        let s = Arc::new(Stats::new());
         assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 0);
         {
-            let _scope = s.scope(Op::Lookup);
+            let _scope = OwnedOpScope::new(Arc::clone(&s), Op::Lookup);
             assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 1);
         }
         assert_eq!(s.hists.lookup.in_flight.load(Ordering::Relaxed), 0);
@@ -929,9 +946,9 @@ mod tests {
 
     #[test]
     fn nested_scopes_dont_corrupt_in_flight() {
-        let s = Stats::new();
-        let scope_a = s.scope(Op::Read);
-        let scope_b = s.scope(Op::Read);
+        let s = Arc::new(Stats::new());
+        let scope_a = OwnedOpScope::new(Arc::clone(&s), Op::Read);
+        let scope_b = OwnedOpScope::new(Arc::clone(&s), Op::Read);
         assert_eq!(s.hists.read.in_flight.load(Ordering::Relaxed), 2);
         drop(scope_b);
         assert_eq!(s.hists.read.in_flight.load(Ordering::Relaxed), 1);

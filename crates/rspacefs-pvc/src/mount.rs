@@ -16,9 +16,12 @@
 //! - A name (cosmetic, used in logs and capture-output filenames).
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use rspacefs_core::LayerFS;
 use vfs::VfsPath;
+
+use crate::swap::{RootHandle, SwappableRoot};
 
 /// PVC access mode — mirrors the Kubernetes PVC access mode taxonomy
 /// but is enforced at the rspacefs layer (FUSE / library) rather than
@@ -138,10 +141,13 @@ pub struct PvcMount {
     pub(crate) name: String,
     pub(crate) access_mode: PvcAccessMode,
     pub(crate) lifecycle: PvcLifecycle,
-    /// The merged view (LayerFS-wrapped). Consumers operate through
-    /// this; `pivot_upper` replaces it with a fresh `LayerFS` over the
-    /// new upper + same lowers.
+    /// The merged view. A `SwappableRoot` over the current `LayerFS`,
+    /// so clones handed to a FUSE adapter (or any consumer) observe a
+    /// `pivot_upper` without being rebuilt.
     pub(crate) merged: VfsPath,
+    /// Write side of the `SwappableRoot` — `pivot_upper` stores a fresh
+    /// `LayerFS` root here and every `merged` clone re-roots atomically.
+    pub(crate) root_handle: RootHandle,
     pub(crate) upper: VfsPath,
     pub(crate) upper_physical: Option<PathBuf>,
     /// Mirror of the lowers handed to `LayerFS::new`. `LayerFS` itself
@@ -217,12 +223,17 @@ impl PvcMount {
         }
 
         let lowers_physical = vec![None; lowers.len()];
-        let merged = VfsPath::new(LayerFS::new(upper.clone(), lowers.clone()));
+        let root_handle: RootHandle = Arc::new(RwLock::new(VfsPath::new(LayerFS::new(
+            upper.clone(),
+            lowers.clone(),
+        ))));
+        let merged = VfsPath::new(SwappableRoot::new(Arc::clone(&root_handle)));
         Ok(Self {
             name,
             access_mode,
             lifecycle,
             merged,
+            root_handle,
             upper,
             upper_physical,
             lowers,

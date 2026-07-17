@@ -51,6 +51,7 @@ Synchronous file I/O via the `vfs` trait. No async, no tokio.
 |--------------------|----------------------------|-------------------------------------------------------------------------|
 | `rspacefs-core`    | `crates/rspacefs-core/`    | LayerFS impl: upper + N lower layers, OCI whiteouts, copy-up. Whiteout cache makes 150+ layer stacks O(1) after warmup. |
 | `rspacefs-verity`  | `crates/rspacefs-verity/`  | SHA-256 Merkle tree, layer manifest, verified-block cache, streaming `VerifiedReader`. Tamper detection at block granularity. |
+| `rspacefs-pvc`     | `crates/rspacefs-pvc/`     | PVC primitives over LayerFS: empty-lower mounts, live `pivot_upper` (via a swappable merged root), deterministic `capture_layer` (tar+zstd + sha256), `apply_blob` extraction. Pure library — consumed by the FUSE daemon (`--pvc` mode), the CLI (`rspacefs pvc`), qregistry, rspaced. Design: `enhancements/pvc-registry-content.md`, usage: `docs/pvc.md`. |
 | `rspacefs-cli`     | `crates/rspacefs-cli/`     | `rspacefs` binary: `overlay {ls,cat,stat}`, `verity {build,verify,inspect}`, `ctl {ping,status,invalidate,stats,info,ops}`. |
 | `rspacefs-fuse`    | `crates/rspacefs-fuse/`    | `rspacefs-mount` Linux daemon: real FUSE mount, mount_program-compatible argv, self-daemonizing fork, FUSE_PASSTHROUGH on kernel ≥ 6.9. |
 
@@ -62,7 +63,8 @@ can be a lower layer of another overlay, etc.
 
 - `rspacefs-core` — only `vfs`.
 - `rspacefs-verity` — `vfs`, `sha2`, `serde`, `serde_json`, `tracing`.
-- `rspacefs-cli` — both library crates plus `clap`, `anyhow`.
+- `rspacefs-pvc` — `rspacefs-core`, `vfs`, `sha2`, `tar`, `zstd`, `thiserror`.
+- `rspacefs-cli` — the three library crates plus `clap`, `anyhow`.
 - `rspacefs-fuse` — both library crates plus `fuser` (0.16 with `abi-7-40`
   for FUSE_PASSTHROUGH), `libc`, `xattr`, `clap`, `anyhow`,
   `tracing-subscriber`. `fuser` and `libc` are gated by
@@ -135,7 +137,7 @@ runtime `pivot_root`s the container into it.
 
 ## Work Plan
 
-### Current Version: `v0.1.0`
+### Current Version: `v0.3.0`
 
 ### TODO (priority order)
 
@@ -196,6 +198,16 @@ runtime `pivot_root`s the container into it.
 - [ ] Stats wiring across FUSE ops.
 
 ### Recently Completed
+
+- [x] (2026-07-17) **Data-PVC mode end-to-end** (`refs #12`).
+  `rspacefs-mount --pvc` (zero-lower mounts, blob lowers, `--owner`,
+  daemonizing, read-only mode), control-socket `pivot-upper` (live via
+  `SwappableRoot`) + `capture-layer`, `rspacefs pvc {init,apply,capture}`
+  + matching `ctl` subcommands, `rspacefs_pivots_total` /
+  `rspacefs_captures_total` metrics, zero-lower LayerFS regression test,
+  round-trip integration test, `docs/pvc.md`. Compiles/tests run on
+  dev.g8.lo (Linux build host). Follow-ups: lazy blob extraction,
+  per-entry owner attrs, `rspacefs-csi` (see `enhancements/rspacefs-csi.md`).
 
 - [x] (2026-05-21) Self-deadlock fix in `lower_is_opaque_above` — read
   guard's temporary scope under Rust 2021 edition kept the read lock
