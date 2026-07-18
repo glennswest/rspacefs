@@ -127,7 +127,7 @@ and rspaced link it directly; see
 
 Today the mount is owned by whoever invokes `rspacefs-mount --pvc`
 (boot agent, operator, scripts). Native PVC provisioning via a CSI
-driver (`rspacefs-csi`) is planned — see
-`enhancements/rspacefs-csi.md`. Note this is orthogonal to image
-rootfs mounts: CSI-provisioned volumes from other drivers already work
-fine on top of rspacefs `mount_program` rootfs mounts.
+driver (`rspacefs-csi`) is planned in its own repo:
+<https://github.com/glennswest/rspacefs-csi>. Note this is orthogonal to
+image rootfs mounts: CSI-provisioned volumes from other drivers already
+work fine on top of rspacefs `mount_program` rootfs mounts.

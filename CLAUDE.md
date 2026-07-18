@@ -207,7 +207,8 @@ runtime `pivot_root`s the container into it.
   `rspacefs_captures_total` metrics, zero-lower LayerFS regression test,
   round-trip integration test, `docs/pvc.md`. Compiles/tests run on
   dev.g8.lo (Linux build host). Follow-ups: lazy blob extraction,
-  per-entry owner attrs, `rspacefs-csi` (see `enhancements/rspacefs-csi.md`).
+  per-entry owner attrs, `rspacefs-csi` (own repo:
+  https://github.com/glennswest/rspacefs-csi).
 
 - [x] (2026-05-21) Self-deadlock fix in `lower_is_opaque_above` — read
   guard's temporary scope under Rust 2021 edition kept the read lock
