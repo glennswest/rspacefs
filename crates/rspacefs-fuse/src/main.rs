@@ -290,9 +290,14 @@ mod linux_main {
         // the synthesized empty-upper tempdir if one was created.
         let mp = mountpoint.clone();
         let tmp_upper = _upper_tmpdir_keep.clone();
+        // Session::new + run() rather than mount2() so we own the teardown
+        // and can suppress fuser's spurious post-lazy-unmount error (#2).
         let session_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fuser::mount2(fs, &mountpoint, &opts)
-                .context("FUSE mount failed (need /dev/fuse access?)")
+            let mut session = fuser::Session::new(fs, &mountpoint, &opts)
+                .context("FUSE mount failed (need /dev/fuse access?)")?;
+            let ran = session.run().context("FUSE session ended with error");
+            drop_session_quietly(session, &mountpoint);
+            ran
         }));
         cleanup_mount_on_exit(&mp, tmp_upper.as_deref());
         match session_result {
@@ -322,14 +327,23 @@ mod linux_main {
     /// 'Transport endpoint is not connected' zombie class.
     fn cleanup_mount_on_exit(mountpoint: &std::path::Path, tmp_upper: Option<&std::path::Path>) {
         use std::os::unix::ffi::OsStrExt;
-        if let Ok(c) = std::ffi::CString::new(mountpoint.as_os_str().as_bytes()) {
+        // Skip the syscall when the mountpoint is already detached —
+        // otherwise this is a guaranteed EINVAL on every clean shutdown,
+        // since the common case is that fuser (or containers-storage)
+        // already unmounted it. See #2.
+        if !is_mountpoint(mountpoint) {
+            tracing::debug!(
+                mountpoint = %mountpoint.display(),
+                "mountpoint already detached on exit; nothing to unmount"
+            );
+        } else if let Ok(c) = std::ffi::CString::new(mountpoint.as_os_str().as_bytes()) {
             // SAFETY: c is a valid C string; umount2 is a syscall wrapper.
             let rc = unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
             if rc == 0 {
                 tracing::info!(mountpoint = %mountpoint.display(), "lazy-unmounted on session exit");
             } else {
                 let errno = std::io::Error::last_os_error();
-                // EINVAL = mountpoint isn't mounted (already gone). Not an error.
+                // EINVAL = raced with someone else's unmount. Not an error.
                 // EPERM = no privileges. Caller is root for mount_program; warn.
                 tracing::debug!(
                     mountpoint = %mountpoint.display(),
@@ -340,6 +354,87 @@ mod linux_main {
         }
         if let Some(t) = tmp_upper {
             let _ = std::fs::remove_dir_all(t);
+        }
+    }
+
+    /// True if `path` is currently a mountpoint in this process's mount
+    /// namespace, per `/proc/self/mountinfo`.
+    ///
+    /// This is the check fuser *can't* make: its `Mount::drop` guards on
+    /// `is_mounted()`, which polls the `/dev/fuse` fd — and fuser documents
+    /// that this "will return true if the filesystem has been detached
+    /// (lazy unmounted), but not yet destroyed by the kernel". `MNT_DETACH`
+    /// removes the entry from the namespace's mount table immediately, so
+    /// mountinfo tells the truth where the device poll does not.
+    ///
+    /// On failure to read mountinfo we return `true` (assume still mounted)
+    /// so callers fall back to their normal unmount path rather than
+    /// silently skipping a teardown that was actually needed.
+    fn is_mountpoint(path: &std::path::Path) -> bool {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return true;
+        };
+        let target = path.to_string_lossy();
+        mountinfo.lines().any(|line| {
+            // Field 5 (0-indexed 4) is the mount point. Whitespace and
+            // backslashes are octal-escaped by the kernel.
+            line.split(' ')
+                .nth(4)
+                .is_some_and(|m| unescape_mountinfo(m) == target)
+        })
+    }
+
+    /// Decode the octal escapes the kernel writes into `/proc/self/mountinfo`
+    /// path fields (space, tab, newline, backslash).
+    fn unescape_mountinfo(field: &str) -> String {
+        if !field.contains('\\') {
+            return field.to_string();
+        }
+        let mut out = String::with_capacity(field.len());
+        let bytes = field.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 3 < bytes.len() {
+                let oct = &field[i + 1..i + 4];
+                if let Ok(v) = u8::from_str_radix(oct, 8) {
+                    out.push(v as char);
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    /// Tear down a finished FUSE session without fuser emitting a spurious
+    /// `Unmount failed: Invalid argument (os error 22)` at ERROR level (#2).
+    ///
+    /// When the mountpoint is still live we drop normally and let fuser do
+    /// its own unmount — that is the correct, complete teardown.
+    ///
+    /// When the mountpoint has already been detached (containers-storage
+    /// lazy-unmounts the merged tree before we exit), fuser's device-poll
+    /// guard still believes it is mounted, so it calls the non-lazy
+    /// `umount(2)` on a path that is no longer a mountpoint, gets EINVAL,
+    /// and logs it as an error. The mount is genuinely gone and the daemon
+    /// is exiting, so that line is pure noise on an otherwise clean
+    /// shutdown. In that case we deliberately leak the session so fuser
+    /// never attempts the unmount. The process exits immediately after, so
+    /// the kernel reclaims the fds — nothing outlives us.
+    fn drop_session_quietly<FS: fuser::Filesystem>(
+        session: fuser::Session<FS>,
+        mountpoint: &std::path::Path,
+    ) {
+        if is_mountpoint(mountpoint) {
+            drop(session);
+        } else {
+            tracing::debug!(
+                mountpoint = %mountpoint.display(),
+                "mountpoint already detached; skipping fuser's redundant unmount"
+            );
+            std::mem::forget(session);
         }
     }
 
@@ -812,6 +907,10 @@ mod linux_main {
                 .context("failed to start control socket")?;
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.run()));
                 let _ = std::fs::remove_file(sock_path);
+                // Drop the session BEFORE our own lazy unmount — otherwise we
+                // detach the mountpoint out from under fuser and it logs a
+                // spurious EINVAL on its own teardown (#2).
+                drop_session_quietly(session, &mp);
                 cleanup_mount_on_exit(&mp, None);
                 match res {
                     Ok(Ok(())) => Ok(()),
@@ -831,8 +930,11 @@ mod linux_main {
             }
             None => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fuser::mount2(fs, &cli.mountpoint, &opts)
-                        .context("FUSE mount failed (need /dev/fuse access?)")
+                    let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
+                        .context("FUSE mount failed (need /dev/fuse access?)")?;
+                    let ran = session.run().context("FUSE session ended with error");
+                    drop_session_quietly(session, &cli.mountpoint);
+                    ran
                 }));
                 cleanup_mount_on_exit(&mp, None);
                 match res {
@@ -1148,6 +1250,9 @@ mod linux_main {
                 let mp = cli.mountpoint.clone();
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.run()));
                 let _ = std::fs::remove_file(sock_path);
+                // Drop before our own lazy unmount, so fuser doesn't find the
+                // mountpoint detached and log a spurious EINVAL (#2).
+                drop_session_quietly(session, &mp);
                 cleanup_mount_on_exit(&mp, None);
                 match res {
                     Ok(Ok(())) => {}
@@ -1168,8 +1273,11 @@ mod linux_main {
             None => {
                 let mp = cli.mountpoint.clone();
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fuser::mount2(fs, &cli.mountpoint, &opts)
-                        .context("FUSE mount failed (need /dev/fuse access?)")
+                    let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
+                        .context("FUSE mount failed (need /dev/fuse access?)")?;
+                    let ran = session.run().context("FUSE session ended with error");
+                    drop_session_quietly(session, &cli.mountpoint);
+                    ran
                 }));
                 cleanup_mount_on_exit(&mp, None);
                 match res {
@@ -1237,6 +1345,48 @@ mod linux_main {
                 .try_init();
         } else {
             let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::Path;
+
+        #[test]
+        fn unescape_mountinfo_passes_through_plain_paths() {
+            assert_eq!(unescape_mountinfo("/var/lib/kubelet"), "/var/lib/kubelet");
+            assert_eq!(unescape_mountinfo("/"), "/");
+        }
+
+        #[test]
+        fn unescape_mountinfo_decodes_kernel_octal_escapes() {
+            // The kernel escapes space, tab, newline and backslash in
+            // mountinfo path fields.
+            assert_eq!(unescape_mountinfo(r"/mnt/my\040volume"), "/mnt/my volume");
+            assert_eq!(unescape_mountinfo(r"/mnt/a\011b"), "/mnt/a\tb");
+            assert_eq!(unescape_mountinfo(r"/mnt/a\012b"), "/mnt/a\nb");
+            assert_eq!(unescape_mountinfo(r"/mnt/a\134b"), r"/mnt/a\b");
+        }
+
+        #[test]
+        fn unescape_mountinfo_leaves_malformed_escapes_alone() {
+            // A trailing lone backslash must not panic or over-read.
+            assert_eq!(unescape_mountinfo(r"/mnt/weird\"), r"/mnt/weird\");
+            assert_eq!(unescape_mountinfo(r"/mnt/\zz9"), r"/mnt/\zz9");
+        }
+
+        /// #2: the discriminator that lets us skip fuser's redundant unmount.
+        /// `/` is always a mountpoint; a path that cannot exist never is.
+        #[test]
+        fn is_mountpoint_distinguishes_real_mounts() {
+            assert!(is_mountpoint(Path::new("/")));
+            assert!(!is_mountpoint(Path::new(
+                "/definitely-not-a-mountpoint-rspacefs-test"
+            )));
+            // A plain directory that exists but isn't a mount must be false —
+            // otherwise we'd keep issuing the EINVAL-producing umount.
+            assert!(!is_mountpoint(Path::new("/etc")));
         }
     }
 }
