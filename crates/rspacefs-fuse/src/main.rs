@@ -295,6 +295,7 @@ mod linux_main {
         let session_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut session = fuser::Session::new(fs, &mountpoint, &opts)
                 .context("FUSE mount failed (need /dev/fuse access?)")?;
+            arm_termination(&mut session);
             let ran = session.run().context("FUSE session ended with error");
             drop_session_quietly(session, &mountpoint);
             ran
@@ -423,6 +424,56 @@ mod linux_main {
     /// shutdown. In that case we deliberately leak the session so fuser
     /// never attempts the unmount. The process exits immediately after, so
     /// the kernel reclaims the fds — nothing outlives us.
+    /// Set by the signal handler, polled by the watcher thread. The handler
+    /// does nothing but this one atomic store — everything else (locks,
+    /// syscalls, logging) is async-signal-unsafe.
+    static TERMINATE_REQUESTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn handle_terminate(_sig: libc::c_int) {
+        TERMINATE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Arm signal-initiated teardown for a session (#30).
+    ///
+    /// Without this, SIGTERM's default action terminates the process
+    /// instantly: no destructors run, so neither fuser's unmount nor
+    /// `cleanup_mount_on_exit` executes and the mountpoint is left behind as
+    /// a 'Transport endpoint is not connected' zombie — the exact class the
+    /// cleanup was written to prevent, which never got a chance to run.
+    /// systemd stops units with SIGTERM and CRI-O/kubelet terminate helpers
+    /// the same way, so this was the *ordinary* managed-teardown path.
+    ///
+    /// The unmount cannot happen inside the handler (it takes a mutex and
+    /// makes syscalls), hence flag-then-watcher-thread. Unmounting makes
+    /// `Session::run()` return, so the normal teardown path runs exactly as
+    /// it does on a clean exit.
+    ///
+    /// Must be called *after* the daemonizing fork — this spawns a thread,
+    /// and threads do not survive fork(). See #28.
+    fn arm_termination<FS: fuser::Filesystem>(session: &mut fuser::Session<FS>) {
+        // Cast via a raw pointer rather than straight to the integer
+        // sighandler_t — a direct fn-item-to-integer cast trips clippy's
+        // fn_to_numeric_cast_any and is easy to get wrong on other ABIs.
+        let handler = handle_terminate as extern "C" fn(libc::c_int) as *const () as usize;
+        unsafe {
+            for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                libc::signal(sig, handler as libc::sighandler_t);
+            }
+        }
+        let mut unmounter = session.unmount_callable();
+        std::thread::spawn(move || loop {
+            if TERMINATE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("termination signal received; unmounting");
+                if let Err(e) = unmounter.unmount() {
+                    tracing::warn!(error = %e, "unmount on signal failed");
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+    }
+
     fn drop_session_quietly<FS: fuser::Filesystem>(
         session: fuser::Session<FS>,
         mountpoint: &std::path::Path,
@@ -899,6 +950,7 @@ mod linux_main {
                 let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
                     .context("FUSE mount failed (need /dev/fuse access?)")?;
                 let notifier = session.notifier();
+                arm_termination(&mut session);
                 let _ctl = crate::control::spawn_control_thread(
                     sock_path.clone(),
                     control_state,
@@ -932,6 +984,7 @@ mod linux_main {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
                         .context("FUSE mount failed (need /dev/fuse access?)")?;
+                    arm_termination(&mut session);
                     let ran = session.run().context("FUSE session ended with error");
                     drop_session_quietly(session, &cli.mountpoint);
                     ran
@@ -1241,6 +1294,7 @@ mod linux_main {
                 let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
                     .context("FUSE mount failed (need /dev/fuse access?)")?;
                 let notifier = session.notifier();
+                arm_termination(&mut session);
                 let _ctl = crate::control::spawn_control_thread(
                     sock_path.clone(),
                     control_state,
@@ -1275,6 +1329,7 @@ mod linux_main {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut session = fuser::Session::new(fs, &cli.mountpoint, &opts)
                         .context("FUSE mount failed (need /dev/fuse access?)")?;
+                    arm_termination(&mut session);
                     let ran = session.run().context("FUSE session ended with error");
                     drop_session_quietly(session, &cli.mountpoint);
                     ran
