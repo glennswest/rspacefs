@@ -11,19 +11,24 @@ log "node status"
 kubectl get nodes -o wide
 
 log "waiting for all system pods to be Ready (up to 3 min)"
+# A pod is "not ready" if its STATUS isn't Running/Completed OR its READY
+# column (a/b) shows a<b. Checking only STATUS misses the CoreDNS-stranded-
+# on-loopback case (#31): Running but 0/1, cluster DNS dead, node still Ready.
+not_ready() {
+  kubectl get pods -A --no-headers 2>/dev/null | awk '
+    $4 != "Running" && $4 != "Completed" { print; next }
+    { split($3, r, "/"); if (r[1] != r[2]) print }'
+}
 end=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$end" ]; do
-  bad=$(kubectl get pods -A --no-headers 2>/dev/null \
-        | awk '$4 != "Running" && $4 != "Completed" {print}')
-  if [ -z "$bad" ]; then
-    break
-  fi
+  [ -z "$(not_ready)" ] && break
   sleep 5
 done
-remaining=$(kubectl get pods -A --no-headers | awk '$4 != "Running" && $4 != "Completed" {print}' || true)
+remaining="$(not_ready || true)"
 if [ -n "$remaining" ]; then
-  log "WARNING: pods still not Running:"
+  log "pods still not Ready after 3 min:"
   echo "$remaining"
+  die "not all pods reached Ready (READY a/b) — see above"
 fi
 
 log "all pods:"

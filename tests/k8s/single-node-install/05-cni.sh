@@ -61,6 +61,17 @@ case "$CNI" in
     kubectl apply -f "$TMP"
     log "waiting for flannel DaemonSet to be Ready (up to 3 min)"
     kubectl -n kube-flannel rollout status ds/kube-flannel-ds --timeout=180s || die "flannel didn't converge"
+
+    # CoreDNS pods scheduled right after `kubeadm init` had their sandbox
+    # torn down by the crio restart above, before flannel existed. They get
+    # stuck on a loopback (127.0.0.1) sandbox and only ever restart the
+    # container, never re-getting a flannel pod IP — so :8181/ready never
+    # passes and cluster DNS stays dead while the node still reports Ready.
+    # Force fresh sandboxes now that the pod network is up. See issue #31.
+    log "recreating CoreDNS so it lands on the flannel pod network (#31)"
+    kubectl -n kube-system delete pod -l k8s-app=kube-dns --ignore-not-found
+    kubectl -n kube-system rollout status deploy/coredns --timeout=120s \
+      || die "coredns did not become Ready after flannel"
     ;;
   cilium)
     if ! command -v cilium >/dev/null; then
