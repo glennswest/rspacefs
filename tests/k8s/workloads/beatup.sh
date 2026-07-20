@@ -81,12 +81,18 @@ for img in "${IMAGES[@]}"; do
     # /bin/sh -c true workload (Pending → Running → Succeeded faster
     # than kubectl could observe Ready), so every pod cost 15s of
     # timeout regardless of real work (refs #10).
-    kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
+    # `if` context so a single failed pod run (e.g. an image that won't
+    # pull) is recorded as Failed and the run continues — NOT aborted by
+    # `set -e`. PHASE 1 already tolerates pull failures this way; a bad
+    # image ref must not kill the whole 200-pod beatup at pod #41.
+    if kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
         --attach --rm \
-        --command -- /bin/sh -c "true" >/dev/null 2>&1
-    rc=$?
+        --command -- /bin/sh -c "true" >/dev/null 2>&1; then
+      phase=Succeeded
+    else
+      phase=Failed
+    fi
     end=$(date +%s.%N)
-    phase=$([ $rc -eq 0 ] && echo Succeeded || echo Failed)
     dur=$(awk "BEGIN { printf \"%.2f\", $end - $start }")
     echo "$img,$r,$dur,$phase" >>"$RUN_CSV"
   done
@@ -106,12 +112,16 @@ for round in 1 2; do
       start=$(date +%s.%N)
       # `--attach --rm` waits for exit + cleans up; one round-trip
       # instead of run+wait+delete (refs #10).
-      kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
+      # Same failure tolerance as PHASE 2 (also guards this subshell's
+      # own `set -e` so a failed run still records a row).
+      if kubectl run "$name" -n "$NS" --image="$img" --restart=Never --image-pull-policy=IfNotPresent \
           --attach --rm \
-          --command -- /bin/sh -c "true" >/dev/null 2>&1
-      rc=$?
+          --command -- /bin/sh -c "true" >/dev/null 2>&1; then
+        phase=Succeeded
+      else
+        phase=Failed
+      fi
       end=$(date +%s.%N)
-      phase=$([ $rc -eq 0 ] && echo Succeeded || echo Failed)
       dur=$(awk "BEGIN { printf \"%.2f\", $end - $start }")
       echo "$img,$round,$dur,$phase" >>"$PAR_CSV"
     ) &
