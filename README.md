@@ -1,5 +1,12 @@
 # rspacefs
 
+> ## OBSOLETE — 2026-08-23
+>
+> Not part of the stormcos boot path any more. A node's root is a stormblock
+> volume exported over ublk; there is no rspacefs layer between them.
+>
+> Kept for reference. Do not build new work on it.
+
 **A tamper-evident, rootless, user-space container rootfs engine for
 OpenShift / Kubernetes — and anywhere else `containers-storage` runs.**
 
