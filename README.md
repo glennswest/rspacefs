@@ -1,3 +1,8 @@
+<!-- rustyclaw:obsolete -->
+> **rspacefs is obsolete.**
+>
+> It is kept for reference and is no longer built, tested, or worked on. Issues raised here are not being picked up.
+
 # rspacefs
 
 > ## OBSOLETE — 2026-08-23
